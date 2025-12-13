@@ -2,40 +2,97 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 function App() {
-  // Views: home menu + the 3 features
+  // Views
   const [view, setView] = useState("home"); // home | live | record | roleplay
 
-  // Live Coach state (mic + meter)
-  const [status, setStatus] = useState("Idle");
-  const [isRunning, setIsRunning] = useState(false);
+  // Shared mic device list
   const [devices, setDevices] = useState([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   const [permissionState, setPermissionState] = useState("unknown"); // unknown | granted | denied
+
+  // Live Coach
+  const [status, setStatus] = useState("Idle");
+  const [isListening, setIsListening] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
   const [sayThisNext, setSayThisNext] = useState(
-    "Click START to begin listening. Momentum AI will show your next line here."
+    "Click START. When the client pauses, Momentum AI will show your next line here."
   );
 
+  // Recorder
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingHint, setRecordingHint] = useState("Ready.");
+  const [recordings, setRecordings] = useState([]); // { id, name, blobUrl, sizeKb, createdAt }
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+
+  // Roleplay
+  const OBJECTIONS = useMemo(
+    () => [
+      {
+        key: "busy",
+        client: "I’m busy right now.",
+        better: "Totally get it — this’ll take 60 seconds. Are you at least still interested in getting something in place?",
+        tips: ["Acknowledge", "Timeframe assurance", "Yes/no question"],
+      },
+      {
+        key: "not_interested",
+        client: "I’m not interested.",
+        better: "No worries — real quick, do you currently have a policy or two in place?",
+        tips: ["Don’t argue", "Ask a simple question", "Move to discovery"],
+      },
+      {
+        key: "wife",
+        client: "I need to talk to my wife/husband.",
+        better: "Of course — is your spouse available for 2 minutes so we can handle it together? If not, what time today are you both free?",
+        tips: ["Agree", "Invite them in", "Lock a time"],
+      },
+      {
+        key: "already_have",
+        client: "I already have something in place.",
+        better: "Perfect — most people do. Is it through work or personal, and do you know what it would actually pay out today?",
+        tips: ["Validate", "Clarify type", "Expose gaps"],
+      },
+      {
+        key: "cant_afford",
+        client: "I can’t afford it.",
+        better: "I hear you — that’s why we look at options. What monthly number would feel comfortable if we can get you approved?",
+        tips: ["Empathy", "Control the budget", "Keep moving"],
+      },
+      {
+        key: "dont_give_info",
+        client: "I don’t want to give out my info.",
+        better: "I understand — we only use it to see if you can qualify. If you don’t qualify, we stop right there. Fair?",
+        tips: ["Reduce risk", "Explain why", "Ask for agreement"],
+      },
+    ],
+    []
+  );
+
+  const [rpIndex, setRpIndex] = useState(0);
+  const [rpUser, setRpUser] = useState("");
+  const [rpScore, setRpScore] = useState(null);
+
+  // WebAudio meter + silence detection (Live Coach)
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const rafRef = useRef(null);
 
-  // Strict black + emerald palette (no blues)
+  const lastTalkRef = useRef(Date.now());
+  const lastTriggerRef = useRef(0);
+
+  // Strict black + emerald palette
   const C = {
     bg: "#050607",
     panel: "#0A0B0D",
     panel2: "#070809",
-    border: "rgba(255,255,255,0.08)",
     text: "#EDEFF2",
     muted: "#A8AFB7",
     emerald: "#10B981",
-    emeraldSoft: "rgba(16,185,129,0.18)",
-    emeraldGlow: "rgba(16,185,129,0.45)",
+    emeraldGlow: "rgba(16,185,129,0.35)",
+    border: "rgba(255,255,255,0.08)",
     danger: "#FF6B6B",
   };
-
-  const canStart = useMemo(() => !isRunning, [isRunning]);
 
   async function ensureMicPermission() {
     try {
@@ -51,10 +108,8 @@ function App() {
 
   async function loadDevices() {
     const ok = permissionState === "granted" ? true : await ensureMicPermission();
-    if (!ok) {
-      setSayThisNext("Microphone permission denied. Allow mic access to use Momentum AI.");
-      return;
-    }
+    if (!ok) return;
+
     const all = await navigator.mediaDevices.enumerateDevices();
     const inputs = all.filter((d) => d.kind === "audioinput");
     setDevices(inputs);
@@ -72,75 +127,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function startMeter(stream) {
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AudioContext();
-    audioCtxRef.current = ctx;
-
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyserRef.current = analyser;
-
-    source.connect(analyser);
-
-    const data = new Uint8Array(analyser.fftSize);
-
-    const tick = () => {
-      if (!analyserRef.current) return;
-
-      analyserRef.current.getByteTimeDomainData(data);
-
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) {
-        const v = (data[i] - 128) / 128;
-        sum += v * v;
-      }
-      const rms = Math.sqrt(sum / data.length);
-      const level = Math.max(0, Math.min(100, Math.round(rms * 200)));
-      setMicLevel(level);
-
-      rafRef.current = requestAnimationFrame(tick);
-    };
-
-    rafRef.current = requestAnimationFrame(tick);
-  }
-
-  async function start() {
-    if (isRunning) return;
-
-    setStatus("Requesting microphone…");
-    setSayThisNext("Listening…");
-    setMicLevel(0);
-
-    const ok = permissionState === "granted" ? true : await ensureMicPermission();
-    if (!ok) {
-      setStatus("Mic permission denied");
-      setSayThisNext("Allow microphone access, then try again.");
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true,
-      });
-
-      streamRef.current = stream;
-      startMeter(stream);
-
-      setIsRunning(true);
-      setStatus("Listening");
-    } catch {
-      setStatus("Could not start microphone");
-      setSayThisNext("Could not access that mic. Pick another mic from the dropdown.");
-    }
-  }
-
-  function stop() {
-    if (!isRunning) return;
-
-    setStatus("Stopping…");
-
+  function cleanupLiveAudio() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
     analyserRef.current = null;
@@ -155,10 +142,210 @@ function App() {
       streamRef.current = null;
     }
 
-    setIsRunning(false);
     setMicLevel(0);
+  }
+
+  function startMeterAndSilenceDetection(stream) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyserRef.current = analyser;
+    source.connect(analyser);
+
+    const data = new Uint8Array(analyser.fftSize);
+
+    const SILENCE_THRESHOLD = 0.03; // tweak if needed
+    const SILENCE_MS = 900; // how long of quiet before triggering
+    const COOLDOWN_MS = 1600;
+
+    const autoLines = [
+      "No worries — real quick, do you currently have a policy or two in place?",
+      "Okay, and is that through work or personal?",
+      "Got it. If it’s okay, this’ll take about a minute so we can see if you can even get approved.",
+      "Before we go further, about how much do you have set aside right now for final expenses?",
+      "Fair enough — what monthly number would feel comfortable if we can get you approved?",
+    ];
+
+    const tick = () => {
+      if (!analyserRef.current) return;
+
+      analyserRef.current.getByteTimeDomainData(data);
+
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+
+      const level = Math.max(0, Math.min(100, Math.round(rms * 200)));
+      setMicLevel(level);
+
+      const now = Date.now();
+      if (rms > SILENCE_THRESHOLD) {
+        lastTalkRef.current = now;
+      } else {
+        const silentFor = now - lastTalkRef.current;
+        const sinceLastTrigger = now - lastTriggerRef.current;
+
+        if (silentFor >= SILENCE_MS && sinceLastTrigger >= COOLDOWN_MS) {
+          lastTriggerRef.current = now;
+
+          // rotate suggestions
+          const pick = autoLines[Math.floor(Math.random() * autoLines.length)];
+          setSayThisNext(pick);
+        }
+      }
+
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
+  async function startLive() {
+    if (isListening) return;
+
+    setStatus("Requesting microphone…");
+    setSayThisNext("Listening… (auto-suggest triggers on pauses)");
+    const ok = permissionState === "granted" ? true : await ensureMicPermission();
+    if (!ok) {
+      setStatus("Mic permission denied");
+      setSayThisNext("Allow microphone access, then try again.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true,
+      });
+
+      streamRef.current = stream;
+      lastTalkRef.current = Date.now();
+      lastTriggerRef.current = 0;
+
+      startMeterAndSilenceDetection(stream);
+
+      setIsListening(true);
+      setStatus("Listening");
+    } catch {
+      setStatus("Could not start microphone");
+      setSayThisNext("Could not access that mic. Pick another mic from the dropdown.");
+    }
+  }
+
+  function stopLive() {
+    if (!isListening) return;
+    setStatus("Stopping…");
+    cleanupLiveAudio();
+    setIsListening(false);
     setStatus("Idle");
     setSayThisNext("Stopped. Click START to listen again.");
+  }
+
+  async function startRecording() {
+    if (isRecording) return;
+
+    setRecordingHint("Requesting microphone…");
+    const ok = permissionState === "granted" ? true : await ensureMicPermission();
+    if (!ok) {
+      setRecordingHint("Mic permission denied.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true,
+      });
+
+      chunksRef.current = [];
+      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = mr;
+
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      mr.onstop = () => {
+        // stop tracks
+        stream.getTracks().forEach((t) => t.stop());
+
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const blobUrl = URL.createObjectURL(blob);
+
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const name = `momentum-ai-recording-${ts}.webm`;
+
+        setRecordings((prev) => [
+          {
+            id: crypto.randomUUID(),
+            name,
+            blobUrl,
+            sizeKb: Math.round(blob.size / 1024),
+            createdAt: new Date().toLocaleString(),
+          },
+          ...prev,
+        ]);
+
+        setRecordingHint("Saved to list below. Click “Download” to save locally.");
+      };
+
+      mr.start();
+      setIsRecording(true);
+      setRecordingHint("Recording…");
+    } catch {
+      setRecordingHint("Could not start recording. Try another mic.");
+    }
+  }
+
+  function stopRecording() {
+    if (!isRecording) return;
+    setRecordingHint("Stopping…");
+    setIsRecording(false);
+
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== "inactive") mr.stop();
+    mediaRecorderRef.current = null;
+  }
+
+  function downloadRecording(rec) {
+    const a = document.createElement("a");
+    a.href = rec.blobUrl;
+    a.download = rec.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function scoreResponse(userText, betterText) {
+    // simple scoring: keyword overlap (no AI yet)
+    const clean = (s) =>
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, "")
+        .split(/\s+/)
+        .filter(Boolean);
+
+    const u = new Set(clean(userText));
+    const b = new Set(clean(betterText));
+
+    let overlap = 0;
+    b.forEach((w) => {
+      if (u.has(w)) overlap += 1;
+    });
+
+    const raw = b.size ? overlap / b.size : 0;
+    return Math.max(0, Math.min(100, Math.round(raw * 100)));
+  }
+
+  function nextRoleplay() {
+    setRpScore(null);
+    setRpUser("");
+    setRpIndex((i) => (i + 1) % OBJECTIONS.length);
   }
 
   function Shell({ children }) {
@@ -166,18 +353,18 @@ function App() {
       <div
         style={{
           minHeight: "100vh",
-          background: `radial-gradient(900px 550px at 18% 10%, ${C.emeraldSoft}, transparent 60%),
+          background: `radial-gradient(900px 550px at 18% 10%, rgba(16,185,129,0.18), transparent 60%),
                        radial-gradient(800px 520px at 86% 18%, rgba(16,185,129,0.10), transparent 58%),
                        ${C.bg}`,
           color: C.text,
-          padding: 20,
+          padding: 16,
           boxSizing: "border-box",
           fontFamily:
             'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial',
         }}
       >
-        <div style={{ maxWidth: 1040, margin: "0 auto" }}>
-          {/* Header */}
+        <div style={{ maxWidth: 520, margin: "0 auto" }}>
+          {/* Header (no subtitle per your request) */}
           <div
             style={{
               display: "flex",
@@ -187,13 +374,8 @@ function App() {
               marginBottom: 14,
             }}
           >
-            <div>
-              <div style={{ fontSize: 28, fontWeight: 900, letterSpacing: 0.2 }}>
-                Momentum <span style={{ color: C.emerald }}>AI</span>
-              </div>
-              <div style={{ color: C.muted, marginTop: 4, fontSize: 13 }}>
-                Black + emerald • plug & play • no setup for agents
-              </div>
+            <div style={{ fontSize: 28, fontWeight: 950, letterSpacing: 0.2 }}>
+              Momentum <span style={{ color: C.emerald }}>AI</span>
             </div>
 
             <div
@@ -201,387 +383,270 @@ function App() {
                 display: "flex",
                 alignItems: "center",
                 gap: 10,
-                padding: "10px 12px",
+                padding: "8px 10px",
                 borderRadius: 14,
                 background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
                 border: `1px solid ${C.border}`,
               }}
             >
               <div style={{ fontSize: 12, color: C.muted }}>Status</div>
-              <div style={{ fontSize: 12, fontWeight: 800 }}>{status}</div>
+              <div style={{ fontSize: 12, fontWeight: 900 }}>{status}</div>
               <div
                 style={{
                   width: 10,
                   height: 10,
                   borderRadius: 999,
-                  background: isRunning ? C.emerald : "rgba(255,255,255,0.20)",
-                  boxShadow: isRunning ? `0 0 18px ${C.emeraldGlow}` : "none",
+                  background: isListening || isRecording ? C.emerald : "rgba(255,255,255,0.20)",
+                  boxShadow: isListening || isRecording ? `0 0 18px ${C.emeraldGlow}` : "none",
                 }}
               />
             </div>
           </div>
 
           {children}
-
-          <div style={{ marginTop: 14, color: C.muted, fontSize: 12 }}>
-            Momentum AI • v0.1
-          </div>
         </div>
       </div>
     );
   }
 
-  function Card({ title, desc, onClick }) {
+  function BackBar(title) {
     return (
-      <button
-        onClick={onClick}
-        style={{
-          textAlign: "left",
-          width: "100%",
-          padding: 16,
-          borderRadius: 18,
-          background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-          border: `1px solid rgba(16,185,129,0.45)`,
-          boxShadow: `0 0 0 1px rgba(16,185,129,0.20), 0 0 28px rgba(16,185,129,0.12)`,
-          cursor: "pointer",
-        }}
-        className="noBlueFocus"
-      >
-        <div style={{ fontWeight: 950, fontSize: 16, color: C.text }}>{title}</div>
-        <div style={{ marginTop: 6, fontSize: 13, color: C.muted, lineHeight: 1.35 }}>
-          {desc}
-        </div>
-        <div style={{ marginTop: 12, fontSize: 12, color: C.emerald, fontWeight: 800 }}>
-          Open →
-        </div>
-      </button>
-    );
-  }
-
-  function BackBar() {
-    return (
-      <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
-        <button
-          onClick={() => setView("home")}
-          style={{
-            padding: "10px 12px",
-            borderRadius: 14,
-            background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-            border: `1px solid rgba(16,185,129,0.45)`,
-            boxShadow: `0 0 18px rgba(16,185,129,0.10)`,
-            color: C.text,
-            cursor: "pointer",
-            fontWeight: 800,
-          }}
-          className="noBlueFocus"
-        >
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, alignItems: "center" }}>
+        <button className="btn" onClick={() => setView("home")}>
           ← Menu
         </button>
+        <div style={{ color: C.muted, fontSize: 13, fontWeight: 800 }}>{title}</div>
+      </div>
+    );
+  }
 
-        {view === "live" && (
-          <div style={{ color: C.muted, fontSize: 13, alignSelf: "center" }}>
-            Live Coach
-          </div>
-        )}
-        {view === "record" && (
-          <div style={{ color: C.muted, fontSize: 13, alignSelf: "center" }}>
-            Recorder
-          </div>
-        )}
-        {view === "roleplay" && (
-          <div style={{ color: C.muted, fontSize: 13, alignSelf: "center" }}>
-            Roleplay Trainer
+  function MicBlock() {
+    return (
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>Microphone</div>
+
+        <select
+          value={selectedDeviceId}
+          onChange={(e) => setSelectedDeviceId(e.target.value)}
+          className="field"
+        >
+          {devices.length === 0 ? (
+            <option value="">No mics detected</option>
+          ) : (
+            devices.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label || `Microphone (${d.deviceId.slice(0, 6)}…)`}
+              </option>
+            ))
+          )}
+        </select>
+
+        <button className="btn" style={{ marginTop: 10, width: "100%" }} onClick={loadDevices}>
+          Refresh devices
+        </button>
+
+        {permissionState === "denied" && (
+          <div style={{ marginTop: 8, color: C.danger, fontSize: 12 }}>
+            Mic permission denied. Allow microphone access in OS settings.
           </div>
         )}
       </div>
     );
   }
 
-  // HOME MENU (first screen)
+  // HOME MENU
   if (view === "home") {
+    // equal-height cards + hover pop
+    const cards = [
+      {
+        title: "Live Coach",
+        desc:
+          "Listens to your mic. When the client pauses, Momentum AI pops your next line automatically.",
+        onClick: () => setView("live"),
+      },
+      {
+        title: "Recorder",
+        desc: "Records your mic audio. Stop → Download the file for review & coaching.",
+        onClick: () => setView("record"),
+      },
+      {
+        title: "Roleplay Trainer",
+        desc: "Practice objections. Type your response → get a better response + score.",
+        onClick: () => setView("roleplay"),
+      },
+    ];
+
     return (
       <Shell>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr 1fr",
-            gap: 14,
-            marginTop: 6,
-          }}
-        >
-          <Card
-            title="Live Coach"
-            desc="Listen on your mic. When the client stops talking, Momentum AI shows what you should say next."
-            onClick={() => setView("live")}
-          />
-          <Card
-            title="Recorder"
-            desc="Record your mic audio and save it locally for review, coaching, and training."
-            onClick={() => setView("record")}
-          />
-          <Card
-            title="Roleplay Trainer"
-            desc="Upload a script and roleplay objections. Momentum AI scores and suggests better responses."
-            onClick={() => setView("roleplay")}
-          />
-        </div>
-
-        <div
-          style={{
-            marginTop: 14,
-            padding: 14,
-            borderRadius: 18,
-            background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-            border: `1px solid ${C.border}`,
-            color: C.muted,
-            fontSize: 13,
-            lineHeight: 1.4,
-          }}
-        >
-          No setup for agents. Eventually this will be fully automatic: it only shows your line (no transcript on screen).
-        </div>
-      </Shell>
-    );
-  }
-
-  // RECORD & ROLEPLAY placeholders for now (menu + clean layout)
-  if (view === "record") {
-    return (
-      <Shell>
-        <BackBar />
-        <div
-          style={{
-            padding: 18,
-            borderRadius: 18,
-            background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-            border: `1px solid rgba(16,185,129,0.45)`,
-            boxShadow: `0 0 28px rgba(16,185,129,0.10)`,
-          }}
-        >
-          <div style={{ fontWeight: 950, fontSize: 18 }}>Recorder</div>
-          <div style={{ marginTop: 8, color: C.muted }}>
-            Coming next: Start/Stop recording + save to Desktop/Momentum AI/Recordings.
-          </div>
-        </div>
-      </Shell>
-    );
-  }
-
-  if (view === "roleplay") {
-    return (
-      <Shell>
-        <BackBar />
-        <div
-          style={{
-            padding: 18,
-            borderRadius: 18,
-            background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-            border: `1px solid rgba(16,185,129,0.45)`,
-            boxShadow: `0 0 28px rgba(16,185,129,0.10)`,
-          }}
-        >
-          <div style={{ fontWeight: 950, fontSize: 18 }}>Roleplay Trainer</div>
-          <div style={{ marginTop: 8, color: C.muted }}>
-            Coming next: upload script + roleplay objections + score improvements.
-          </div>
-        </div>
-      </Shell>
-    );
-  }
-
-  // LIVE COACH screen
-  return (
-    <Shell>
-      <BackBar />
-
-      <div style={{ display: "grid", gridTemplateColumns: "360px 1fr", gap: 16 }}>
-        {/* Left controls */}
-        <div
-          style={{
-            background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-            border: `1px solid ${C.border}`,
-            borderRadius: 18,
-            padding: 14,
-          }}
-        >
-          <div style={{ fontWeight: 950, fontSize: 14, marginBottom: 10 }}>Controls</div>
-
-          {/* Mic dropdown (fix overlap by stacking refresh below on small space) */}
-          <div style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>Microphone</div>
-
-            <select
-              value={selectedDeviceId}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-              className="noBlueFocus"
-              style={{
-                width: "100%",
-                padding: "10px 10px",
-                borderRadius: 14,
-                border: `1px solid rgba(16,185,129,0.45)`,
-                background: "#050607",
-                color: C.text,
-                outline: "none",
-                boxShadow: `0 0 18px rgba(16,185,129,0.08)`,
-              }}
-            >
-              {devices.length === 0 ? (
-                <option value="">No mics detected</option>
-              ) : (
-                devices.map((d) => (
-                  <option key={d.deviceId} value={d.deviceId}>
-                    {d.label || `Microphone (${d.deviceId.slice(0, 6)}…)`}
-                  </option>
-                ))
-              )}
-            </select>
-
-            <button
-              onClick={loadDevices}
-              className="noBlueFocus"
-              style={{
-                marginTop: 10,
-                width: "100%",
-                padding: "10px 12px",
-                borderRadius: 14,
-                border: `1px solid rgba(16,185,129,0.45)`,
-                background: "#050607",
-                color: C.text,
-                cursor: "pointer",
-                fontWeight: 800,
-                boxShadow: `0 0 18px rgba(16,185,129,0.08)`,
-              }}
-            >
-              Refresh devices
+        <div className="grid3">
+          {cards.map((c) => (
+            <button key={c.title} className="modeCard" onClick={c.onClick}>
+              <div className="modeTitle">{c.title}</div>
+              <div className="modeDesc">{c.desc}</div>
+              <div className="modeLink">Open →</div>
             </button>
+          ))}
+        </div>
 
-            {permissionState === "denied" && (
-              <div style={{ marginTop: 8, color: C.danger, fontSize: 12 }}>
-                Mic permission denied. Allow microphone access in OS settings.
-              </div>
-            )}
+        {/* Fill the page with "How it works" */}
+        <div className="howItWorks">
+          <div className="howTitle">How it works</div>
+          <ol className="howList">
+            <li>Pick your microphone (or leave default).</li>
+            <li>Start Live Coach while you’re on a call (phone call on speaker / near your mic).</li>
+            <li>When the client pauses, Momentum AI auto-triggers a recommended next line.</li>
+            <li>Use Recorder to save calls for review. Use Roleplay to drill objections daily.</li>
+          </ol>
+          <div className="howNote">
+            To make suggestions based on the client’s exact words, we’ll add speech-to-text next.
+            (Right now it’s pause-triggered coaching + roleplay.)
           </div>
+        </div>
+      </Shell>
+    );
+  }
 
-          {/* Start/Stop: emerald glowing outline only */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 6 }}>
-            <button
-              disabled={!canStart}
-              onClick={start}
-              className="noBlueFocus"
-              style={{
-                padding: "12px 12px",
-                borderRadius: 16,
-                border: `1px solid rgba(16,185,129,0.75)`,
-                background: "#050607",
-                color: canStart ? C.text : C.muted,
-                fontWeight: 950,
-                cursor: canStart ? "pointer" : "not-allowed",
-                boxShadow: canStart ? `0 0 26px rgba(16,185,129,0.16)` : "none",
-              }}
-            >
+  // LIVE
+  if (view === "live") {
+    return (
+      <Shell>
+        {BackBar("Live Coach")}
+
+        <div className="panel">
+          <MicBlock />
+
+          <div className="row2">
+            <button className="btnOutline" disabled={isListening} onClick={startLive}>
               START
             </button>
-
-            <button
-              disabled={!isRunning}
-              onClick={stop}
-              className="noBlueFocus"
-              style={{
-                padding: "12px 12px",
-                borderRadius: 16,
-                border: `1px solid rgba(16,185,129,0.40)`,
-                background: "#050607",
-                color: isRunning ? C.text : C.muted,
-                fontWeight: 950,
-                cursor: isRunning ? "pointer" : "not-allowed",
-                boxShadow: isRunning ? `0 0 22px rgba(16,185,129,0.10)` : "none",
-              }}
-            >
+            <button className="btnOutlineDim" disabled={!isListening} onClick={stopLive}>
               STOP
             </button>
           </div>
 
-          {/* Mic meter */}
-          <div style={{ marginTop: 14 }}>
+          <div style={{ marginTop: 12 }}>
             <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>Mic level</div>
-            <div
-              style={{
-                height: 10,
-                borderRadius: 999,
-                background: "rgba(255,255,255,0.06)",
-                border: `1px solid rgba(16,185,129,0.30)`,
-                overflow: "hidden",
-              }}
-            >
-              <div
-                style={{
-                  width: `${micLevel}%`,
-                  height: "100%",
-                  background: C.emerald,
-                  boxShadow: `0 0 18px ${C.emeraldGlow}`,
-                  transition: "width 60ms linear",
-                }}
-              />
+            <div className="meter">
+              <div className="meterFill" style={{ width: `${micLevel}%` }} />
             </div>
           </div>
         </div>
 
-        {/* Right suggestion */}
-        <div
-          style={{
-            background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-            border: `1px solid ${C.border}`,
-            borderRadius: 18,
-            padding: 16,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-            <div style={{ fontWeight: 950, fontSize: 16 }}>SAY THIS NEXT</div>
-            <div style={{ fontSize: 12, color: C.muted }}>(only shows your line)</div>
-          </div>
+        <div className="panel" style={{ marginTop: 12 }}>
+          <div className="panelTitle">SAY THIS NEXT</div>
+          <div className="sayBox">{sayThisNext}</div>
+          <div className="smallMuted">Auto-triggers on pauses (silence detection).</div>
+        </div>
+      </Shell>
+    );
+  }
 
-          <div
-            style={{
-              marginTop: 12,
-              borderRadius: 18,
-              border: `1px solid rgba(16,185,129,0.55)`,
-              background: "#050607",
-              padding: 16,
-              minHeight: 240,
-              boxShadow: `0 0 32px rgba(16,185,129,0.10)`,
-            }}
-          >
-            <div style={{ fontSize: 20, fontWeight: 950, lineHeight: 1.25, whiteSpace: "pre-wrap" }}>
-              {sayThisNext}
-            </div>
+  // RECORDER (WORKING)
+  if (view === "record") {
+    return (
+      <Shell>
+        {BackBar("Recorder")}
 
-            <div style={{ marginTop: 14, color: C.muted, fontSize: 12, lineHeight: 1.4 }}>
-              Next: pause-trigger detection + Logan-style suggestion engine.
-            </div>
-          </div>
+        <div className="panel">
+          <MicBlock />
 
-          {/* quick dev test button */}
-          <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-            <button
-              onClick={() =>
-                setSayThisNext("No worries — real quick, do you currently have a policy or two in place?")
-              }
-              className="noBlueFocus"
-              style={{
-                padding: "10px 12px",
-                borderRadius: 16,
-                border: `1px solid rgba(16,185,129,0.55)`,
-                background: "#050607",
-                color: C.text,
-                cursor: "pointer",
-                fontWeight: 850,
-                boxShadow: `0 0 22px rgba(16,185,129,0.10)`,
-              }}
-            >
-              Test suggestion
+          <div className="row2">
+            <button className="btnOutline" disabled={isRecording} onClick={startRecording}>
+              START
+            </button>
+            <button className="btnOutlineDim" disabled={!isRecording} onClick={stopRecording}>
+              STOP
             </button>
           </div>
+
+          <div className="smallMuted" style={{ marginTop: 10 }}>
+            {recordingHint}
+          </div>
         </div>
+
+        <div className="panel" style={{ marginTop: 12 }}>
+          <div className="panelTitle">Recordings</div>
+
+          {recordings.length === 0 ? (
+            <div className="smallMuted">No recordings yet.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {recordings.map((r) => (
+                <div
+                  key={r.id}
+                  style={{
+                    border: "1px solid rgba(16,185,129,0.35)",
+                    borderRadius: 14,
+                    padding: 10,
+                    background: "#050607",
+                    boxShadow: `0 0 22px rgba(16,185,129,0.08)`,
+                  }}
+                >
+                  <div style={{ fontWeight: 900 }}>{r.name}</div>
+                  <div className="smallMuted">
+                    {r.createdAt} • {r.sizeKb} KB
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button className="btn" onClick={() => downloadRecording(r)}>
+                      Download
+                    </button>
+                    <audio controls src={r.blobUrl} style={{ width: "100%" }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Shell>
+    );
+  }
+
+  // ROLEPLAY (WORKING)
+  const current = OBJECTIONS[rpIndex];
+  return (
+    <Shell>
+      {BackBar("Roleplay Trainer")}
+
+      <div className="panel">
+        <div className="panelTitle">Client says</div>
+        <div className="sayBox">{current.client}</div>
+
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>Your response</div>
+          <textarea
+            className="field"
+            style={{ minHeight: 110, resize: "none" }}
+            value={rpUser}
+            onChange={(e) => setRpUser(e.target.value)}
+            placeholder="Type what you would say…"
+          />
+        </div>
+
+        <div className="row2" style={{ marginTop: 10 }}>
+          <button
+            className="btnOutline"
+            onClick={() => setRpScore(scoreResponse(rpUser, current.better))}
+            disabled={!rpUser.trim()}
+          >
+            Score it
+          </button>
+          <button className="btnOutlineDim" onClick={nextRoleplay}>
+            Next
+          </button>
+        </div>
+
+        {rpScore !== null && (
+          <div style={{ marginTop: 12 }}>
+            <div className="panelTitle">Better response</div>
+            <div className="sayBox">{current.better}</div>
+
+            <div className="smallMuted" style={{ marginTop: 8 }}>
+              Score: <span style={{ color: C.emerald, fontWeight: 950 }}>{rpScore}/100</span>
+              {" • "}
+              Tips: {current.tips.join(" • ")}
+            </div>
+          </div>
+        )}
       </div>
     </Shell>
   );
