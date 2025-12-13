@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-appmomentum-ai",
+  "productName": "Momentum AI",
   "version": "0.1.0",
   "identifier": "com.momentum.ai",
   "build": {
@@ -12,9 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-appmomentum-ai",
-        "width": 800,
-        "height": 600
+        "title": "Momentum AI",
+        "width": 980,
+        "height": 720,
+        "resizable": true
       }
     ],
     "security": {
