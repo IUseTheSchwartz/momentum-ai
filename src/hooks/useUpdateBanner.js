@@ -1,135 +1,140 @@
 // src/hooks/useUpdateBanner.js
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { APP_VERSION } from "../generated/appVersion";
 
-function getCurrentVersion() {
-  try {
-    const v =
-      (typeof import.meta !== "undefined" && import.meta.env?.VITE_APP_VERSION) ||
-      (typeof window !== "undefined" && window.__APP_VERSION__) ||
-      "0.0.0";
-    return String(v || "0.0.0").trim();
-  } catch {
-    return "0.0.0";
-  }
+function normalize(v) {
+  return String(v || "")
+    .trim()
+    .replace(/^v/i, "");
 }
 
-// Returns: -1 if a<b, 0 if a==b, 1 if a>b
-function compareSemver(a, b) {
-  const parse = (v) =>
-    String(v || "")
-      .trim()
-      .replace(/^v/i, "")
-      .split(/[.+-]/) // "1.2.3-beta" -> ["1","2","3","beta"]
-      .slice(0, 3)
-      .map((x) => {
-        const n = Number(x);
-        return Number.isFinite(n) ? n : 0;
-      });
+function parseSemver(v) {
+  // supports: "1.2.3", "1.2", "1", "1.2.3-beta.1"
+  const s = normalize(v);
+  const [core, pre = ""] = s.split("-", 2);
 
-  const A = parse(a);
-  const B = parse(b);
+  const parts = core.split(".").map((x) => {
+    const n = parseInt(x, 10);
+    return Number.isFinite(n) ? n : 0;
+  });
+
+  while (parts.length < 3) parts.push(0);
+
+  return { parts: parts.slice(0, 3), pre };
+}
+
+function compareSemver(a, b) {
+  const A = parseSemver(a);
+  const B = parseSemver(b);
 
   for (let i = 0; i < 3; i++) {
-    const x = A[i] ?? 0;
-    const y = B[i] ?? 0;
-    if (x < y) return -1;
-    if (x > y) return 1;
+    if (A.parts[i] > B.parts[i]) return 1;
+    if (A.parts[i] < B.parts[i]) return -1;
   }
+
+  // same core; treat prerelease as "lower" than release
+  const aPre = A.pre;
+  const bPre = B.pre;
+  if (!aPre && bPre) return 1;
+  if (aPre && !bPre) return -1;
   return 0;
 }
 
-export default function useUpdateBanner(options = {}) {
-  const {
-    enabled = true,
-    intervalMs = 15000,
-    path = "/version.json",
-  } = options;
+function formatCheckTime(d = new Date()) {
+  // small + safe formatting
+  try {
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
 
-  const CURRENT_VERSION = useMemo(() => getCurrentVersion(), []);
+async function fetchWithTimeout(url, ms = 5000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+
+  try {
+    const res = await fetch(url, {
+      cache: "no-store",
+      signal: ctrl.signal,
+      headers: { "cache-control": "no-cache" },
+    });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+export default function useUpdateBanner() {
+  const CURRENT_VERSION = useMemo(() => normalize(APP_VERSION || "0.0.0"), []);
 
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [latestVersion, setLatestVersion] = useState("");
   const [lastUpdateCheck, setLastUpdateCheck] = useState("");
 
-  const checkingRef = useRef(false);
-  const abortRef = useRef(null);
+  const inFlightRef = useRef(false);
+  const stoppedRef = useRef(false);
 
-  const checkForUpdate = useCallback(async () => {
-    if (!enabled) return;
-    if (checkingRef.current) return;
+  async function checkForUpdate() {
+    if (stoppedRef.current) return;
+    if (inFlightRef.current) return;
 
-    checkingRef.current = true;
-
+    inFlightRef.current = true;
     try {
-      // Abort any prior in-flight fetch (helps in React StrictMode/dev)
-      try {
-        abortRef.current?.abort?.();
-      } catch {}
-      const ac = new AbortController();
-      abortRef.current = ac;
+      const res = await fetchWithTimeout(`/version.json?ts=${Date.now()}`, 5000);
+      setLastUpdateCheck(formatCheckTime(new Date()));
 
-      // In Tauri + Vite, always resolve against current origin
-      const url = new URL(path, window.location.origin);
-      url.searchParams.set("ts", String(Date.now()));
+      if (!res || !res.ok) return;
 
-      const res = await fetch(url.toString(), {
-        cache: "no-store",
-        headers: { "Cache-Control": "no-cache" },
-        signal: ac.signal,
-      });
+      const data = await res.json().catch(() => null);
+      const remote = normalize(data?.version || "");
 
-      if (!res.ok) return;
+      if (!remote) return;
 
-      // Avoid crashing if server returns HTML or something unexpected
-      const text = await res.text();
-      let data = null;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        return;
-      }
+      setLatestVersion(remote);
 
-      const v = String(data?.version || "").trim();
-      if (!v) return;
-
-      setLastUpdateCheck(new Date().toLocaleTimeString());
-
-      // Only show banner if latest > current
-      const newer = compareSemver(CURRENT_VERSION, v) === -1;
-      if (newer) {
-        setLatestVersion(v);
+      // If remote version is greater than current, show banner
+      if (compareSemver(remote, CURRENT_VERSION) > 0) {
         setUpdateAvailable(true);
-      } else {
-        setLatestVersion("");
-        setUpdateAvailable(false);
+        // Once update is detected, we can stop checking to reduce noise
+        stoppedRef.current = true;
       }
     } catch {
-      // ignore (offline / blocked / aborted / etc.)
+      // never throw
+      setLastUpdateCheck(formatCheckTime(new Date()));
     } finally {
-      checkingRef.current = false;
+      inFlightRef.current = false;
     }
-  }, [CURRENT_VERSION, enabled, path]);
+  }
 
   useEffect(() => {
-    if (!enabled) return;
-
     checkForUpdate();
-    const id = window.setInterval(checkForUpdate, intervalMs);
+
+    // check every 60s while app is open (until update found)
+    const id = setInterval(() => {
+      checkForUpdate();
+    }, 60_000);
+
+    // also check when user refocuses the app
+    const onFocus = () => checkForUpdate();
+    window.addEventListener("focus", onFocus);
 
     return () => {
-      window.clearInterval(id);
-      try {
-        abortRef.current?.abort?.();
-      } catch {}
-      checkingRef.current = false;
+      clearInterval(id);
+      window.removeEventListener("focus", onFocus);
     };
-  }, [checkForUpdate, enabled, intervalMs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
-    CURRENT_VERSION,
     updateAvailable,
     latestVersion,
     lastUpdateCheck,
-    checkForUpdate,
+    CURRENT_VERSION,
   };
 }
