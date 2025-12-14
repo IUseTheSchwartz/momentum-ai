@@ -1,110 +1,134 @@
 // src/hooks/useUpdateBanner.js
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-function norm(v) {
-  return String(v || "").trim().replace(/^v/i, "");
+function getCurrentVersion() {
+  try {
+    const v =
+      (typeof import.meta !== "undefined" && import.meta.env?.VITE_APP_VERSION) ||
+      (typeof window !== "undefined" && window.__APP_VERSION__) ||
+      "0.0.0";
+    return String(v || "0.0.0").trim();
+  } catch {
+    return "0.0.0";
+  }
 }
 
-function parseSemver(v) {
-  const [a, b, c] = norm(v).split(".").map((x) => parseInt(x, 10) || 0);
-  return [a || 0, b || 0, c || 0];
-}
+// Returns: -1 if a<b, 0 if a==b, 1 if a>b
+function compareSemver(a, b) {
+  const parse = (v) =>
+    String(v || "")
+      .trim()
+      .replace(/^v/i, "")
+      .split(/[.+-]/) // "1.2.3-beta" -> ["1","2","3","beta"]
+      .slice(0, 3)
+      .map((x) => {
+        const n = Number(x);
+        return Number.isFinite(n) ? n : 0;
+      });
 
-function cmpSemver(a, b) {
-  const pa = parseSemver(a);
-  const pb = parseSemver(b);
+  const A = parse(a);
+  const B = parse(b);
+
   for (let i = 0; i < 3; i++) {
-    if (pa[i] > pb[i]) return 1;
-    if (pa[i] < pb[i]) return -1;
+    const x = A[i] ?? 0;
+    const y = B[i] ?? 0;
+    if (x < y) return -1;
+    if (x > y) return 1;
   }
   return 0;
 }
 
-function getEnvVersion() {
-  try {
-    return (
-      (typeof import.meta !== "undefined" && import.meta.env?.VITE_APP_VERSION) ||
-      (typeof window !== "undefined" && window.__APP_VERSION__) ||
-      ""
-    );
-  } catch {
-    return "";
-  }
-}
+export default function useUpdateBanner(options = {}) {
+  const {
+    enabled = true,
+    intervalMs = 15000,
+    path = "/version.json",
+  } = options;
 
-async function getLocalBundledVersion() {
-  try {
-    const res = await fetch(`/version.json?ts=${Date.now()}`, { cache: "no-store" });
-    if (!res.ok) return "";
-    const data = await res.json();
-    return String(data?.version || "").trim();
-  } catch {
-    return "";
-  }
-}
-
-async function getLatestFromGithub(repo) {
-  // repo = "owner/name"
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, { cache: "no-store" });
-  if (!res.ok) return null;
-  const data = await res.json();
-
-  const latestVersion = norm(data.tag_name || data.name || "");
-  if (!latestVersion) return null;
-
-  // Prefer a direct asset download if available, else fall back to release page
-  let downloadUrl = data.html_url || "";
-  const assets = Array.isArray(data.assets) ? data.assets : [];
-  const asset = assets.find((a) => a?.browser_download_url) || null;
-  if (asset?.browser_download_url) downloadUrl = asset.browser_download_url;
-
-  return { latestVersion, downloadUrl };
-}
-
-export default function useUpdateBanner() {
-  const repo = import.meta.env?.VITE_GITHUB_REPO; // <-- set this
-  const CURRENT_VERSION = useMemo(() => norm(getEnvVersion()), []);
+  const CURRENT_VERSION = useMemo(() => getCurrentVersion(), []);
 
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [latestVersion, setLatestVersion] = useState("");
-  const [downloadUrl, setDownloadUrl] = useState("");
   const [lastUpdateCheck, setLastUpdateCheck] = useState("");
 
-  async function checkForUpdate() {
+  const checkingRef = useRef(false);
+  const abortRef = useRef(null);
+
+  const checkForUpdate = useCallback(async () => {
+    if (!enabled) return;
+    if (checkingRef.current) return;
+
+    checkingRef.current = true;
+
     try {
-      // Determine current version
-      let current = CURRENT_VERSION;
-      if (!current) current = norm(await getLocalBundledVersion());
-      if (!current) current = "0.0.0";
+      // Abort any prior in-flight fetch (helps in React StrictMode/dev)
+      try {
+        abortRef.current?.abort?.();
+      } catch {}
+      const ac = new AbortController();
+      abortRef.current = ac;
 
-      // Determine latest version (remote)
-      if (!repo) return; // nothing to check against
+      // In Tauri + Vite, always resolve against current origin
+      const url = new URL(path, window.location.origin);
+      url.searchParams.set("ts", String(Date.now()));
 
-      const latest = await getLatestFromGithub(repo);
-      if (!latest) return;
+      const res = await fetch(url.toString(), {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+        signal: ac.signal,
+      });
+
+      if (!res.ok) return;
+
+      // Avoid crashing if server returns HTML or something unexpected
+      const text = await res.text();
+      let data = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return;
+      }
+
+      const v = String(data?.version || "").trim();
+      if (!v) return;
 
       setLastUpdateCheck(new Date().toLocaleTimeString());
-      setLatestVersion(latest.latestVersion);
-      setDownloadUrl(latest.downloadUrl || "");
 
-      setUpdateAvailable(cmpSemver(latest.latestVersion, current) === 1);
+      // Only show banner if latest > current
+      const newer = compareSemver(CURRENT_VERSION, v) === -1;
+      if (newer) {
+        setLatestVersion(v);
+        setUpdateAvailable(true);
+      } else {
+        setLatestVersion("");
+        setUpdateAvailable(false);
+      }
     } catch {
-      // ignore
+      // ignore (offline / blocked / aborted / etc.)
+    } finally {
+      checkingRef.current = false;
     }
-  }
+  }, [CURRENT_VERSION, enabled, path]);
 
   useEffect(() => {
+    if (!enabled) return;
+
     checkForUpdate();
-    const id = setInterval(checkForUpdate, 60_000); // 60s (GitHub rate limits if you do 15s)
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const id = window.setInterval(checkForUpdate, intervalMs);
+
+    return () => {
+      window.clearInterval(id);
+      try {
+        abortRef.current?.abort?.();
+      } catch {}
+      checkingRef.current = false;
+    };
+  }, [checkForUpdate, enabled, intervalMs]);
 
   return {
-    CURRENT_VERSION: CURRENT_VERSION || "0.0.0",
+    CURRENT_VERSION,
     updateAvailable,
     latestVersion,
-    downloadUrl,
     lastUpdateCheck,
     checkForUpdate,
   };
