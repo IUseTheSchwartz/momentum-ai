@@ -17,11 +17,13 @@ jobs:
         include:
           - platform: windows-latest
             args: ""
-          # Build both mac architectures so Intel Macs can install too.
+            rust_target: ""
           - platform: macos-latest
             args: "--target aarch64-apple-darwin"
+            rust_target: "aarch64-apple-darwin"
           - platform: macos-latest
             args: "--target x86_64-apple-darwin"
+            rust_target: "x86_64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 
@@ -29,15 +31,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node
-      - uses: actions/setup-node@v4
+        uses: actions/setup-node@v4
         with:
           node-version: lts/*
           cache: npm
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Add Rust target (mac only)
+        if: ${{ matrix.rust_target != '' }}
+        run: rustup target add ${{ matrix.rust_target }}
 
       - uses: swatinem/rust-cache@v2
 
@@ -49,11 +53,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: "Momentum AI v__VERSION__"
-          releaseBody: "See the assets to download and install this version."
           releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
