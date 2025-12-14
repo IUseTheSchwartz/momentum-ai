@@ -5,7 +5,7 @@ export default function Shell({
   children,
   status,
   activeLight,
-  updateBanner, // { updateAvailable, latestVersion, lastUpdateCheck, CURRENT_VERSION, installing, installError, installUpdate }
+  updateBanner, // { updateAvailable, latestVersion, lastUpdateCheck, CURRENT_VERSION, updating, installAndRestart }
 }) {
   return (
     <div
@@ -91,20 +91,15 @@ export default function Shell({
                   Current: v{updateBanner.CURRENT_VERSION}
                   {updateBanner.lastUpdateCheck ? ` • checked ${updateBanner.lastUpdateCheck}` : ""}
                 </div>
-                {!!updateBanner.installError && (
-                  <div style={{ fontSize: 11, color: "rgba(255,180,180,0.95)", marginTop: 4 }}>
-                    {updateBanner.installError}
-                  </div>
-                )}
               </div>
 
               <button
                 className="btn"
-                onClick={() => updateBanner.installUpdate?.()}
-                disabled={!!updateBanner.installing}
-                style={{ whiteSpace: "nowrap", opacity: updateBanner.installing ? 0.7 : 1 }}
+                onClick={() => updateBanner.installAndRestart?.()}
+                disabled={!!updateBanner.updating}
+                style={{ whiteSpace: "nowrap", opacity: updateBanner.updating ? 0.7 : 1 }}
               >
-                {updateBanner.installing ? "Updating..." : "Update"}
+                {updateBanner.updating ? "Updating..." : "Update"}
               </button>
             </div>
           )}
