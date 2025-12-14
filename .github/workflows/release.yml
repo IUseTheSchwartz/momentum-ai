@@ -1,47 +1,40 @@
 name: release
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - "v*"
-  workflow_dispatch:
-
-permissions:
-  contents: write
+      - "v*.*.*"
 
 jobs:
-  build:
+  build-and-release:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        platform: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: lts/*
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install deps
-        run: npm ci
+        run: npm install
 
-      - name: Build + publish release (with updater JSON)
+      - name: Build + publish Tauri release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # set BOTH variants so whichever the action expects will work
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: "Momentum AI v__VERSION__"
+          releaseBody: "Auto-generated release."
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
