@@ -13,15 +13,11 @@
     "windows": [
       {
         "title": "Momentum AI",
-        "width": 420,
+        "width": 430,
         "height": 820,
-        "minWidth": 390,
-        "minHeight": 740,
-        "maxWidth": 520,
-        "maxHeight": 980,
         "resizable": true,
-        "maximizable": false,
-        "center": true
+        "minWidth": 390,
+        "minHeight": 720
       }
     ],
     "security": {
