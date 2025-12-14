@@ -1,6 +1,4 @@
-:root {
-  color-scheme: dark;
-}
+:root { color-scheme: dark; }
 
 html, body {
   margin: 0;
@@ -221,4 +219,25 @@ input:focus-visible {
   color: #A8AFB7;
   font-size: 12px;
   line-height: 1.4;
+}
+
+/* category chips (Roleplay) */
+.chipOn, .chipOff {
+  padding: 8px 10px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 12px;
+  cursor: pointer;
+  background: #050607;
+}
+
+.chipOn {
+  border: 1px solid rgba(16,185,129,0.75);
+  color: #EDEFF2;
+  box-shadow: 0 0 18px rgba(16,185,129,0.12);
+}
+
+.chipOff {
+  border: 1px solid rgba(16,185,129,0.25);
+  color: #A8AFB7;
 }
