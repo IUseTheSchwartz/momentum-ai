@@ -41,7 +41,7 @@ function formatCheckTime(d = new Date()) {
       month: "short",
       day: "2-digit",
       hour: "2-digit",
-      minute: "2-digit",
+      minute: "2-digit"
     });
   } catch {
     return "";
@@ -56,7 +56,7 @@ async function fetchWithTimeout(url, ms = 5000) {
     const res = await fetch(url, {
       cache: "no-store",
       signal: ctrl.signal,
-      headers: { "cache-control": "no-cache" },
+      headers: { "cache-control": "no-cache" }
     });
     return res;
   } finally {
@@ -65,7 +65,6 @@ async function fetchWithTimeout(url, ms = 5000) {
 }
 
 function isTauri() {
-  // Tauri v2 exposes __TAURI_INTERNALS__ in the webview
   return typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 }
 
@@ -80,7 +79,7 @@ export default function useUpdateBanner() {
   const inFlightRef = useRef(false);
   const stoppedRef = useRef(false);
 
-  // Store whatever the updater returns, so install can use it
+  // Store the Update handle returned by plugin-updater
   const updateHandleRef = useRef(null);
 
   async function checkForUpdate() {
@@ -91,49 +90,31 @@ export default function useUpdateBanner() {
     try {
       setLastUpdateCheck(formatCheckTime(new Date()));
 
-      // --- Preferred path: REAL Tauri updater ---
+      // --- REAL Tauri updater path ---
       if (isTauri()) {
-        const mod = await import("@tauri-apps/plugin-updater");
-        const checkFn = mod.check ?? mod.checkUpdate;
-        if (typeof checkFn === "function") {
-          const result = await checkFn();
+        const { check } = await import("@tauri-apps/plugin-updater");
+        const update = await check(); // Update | null
 
-          // Different versions of the plugin return slightly different shapes.
-          // We support the common ones safely.
-          const available =
-            !!result?.available ||
-            !!result?.shouldUpdate ||
-            (typeof result?.updateAvailable === "boolean" ? result.updateAvailable : false);
+        // Per v2 docs: null means no update available.
+        if (update) {
+          updateHandleRef.current = update;
 
-          const remoteVersion =
-            normalize(result?.version) ||
-            normalize(result?.manifest?.version) ||
-            normalize(result?.update?.version) ||
-            "";
-
-          updateHandleRef.current = result;
-
+          const remoteVersion = normalize(update.version || "");
           if (remoteVersion) setLatestVersion(remoteVersion);
 
-          // If plugin already tells us it's available, trust it.
-          if (available) {
+          // If you want a safety compare, keep it; otherwise update != null is enough.
+          if (!remoteVersion || compareSemver(remoteVersion, CURRENT_VERSION) > 0) {
             setUpdateAvailable(true);
             stoppedRef.current = true;
-            return;
           }
-
-          // If plugin didn't give a boolean, fall back to semver compare if we got a version.
-          if (remoteVersion && compareSemver(remoteVersion, CURRENT_VERSION) > 0) {
-            setUpdateAvailable(true);
-            stoppedRef.current = true;
-            return;
-          }
-
           return;
         }
+
+        // no update
+        return;
       }
 
-      // --- Fallback path: your version.json method (ONLY useful if hosted remotely) ---
+      // --- Browser fallback (only useful if version.json is hosted remotely) ---
       const res = await fetchWithTimeout(`/version.json?ts=${Date.now()}`, 5000);
       if (!res || !res.ok) return;
 
@@ -148,7 +129,6 @@ export default function useUpdateBanner() {
         stoppedRef.current = true;
       }
     } catch {
-      // never throw
       setLastUpdateCheck(formatCheckTime(new Date()));
     } finally {
       inFlightRef.current = false;
@@ -157,42 +137,29 @@ export default function useUpdateBanner() {
 
   async function installAndRestart() {
     if (!isTauri()) {
-      // in a normal browser build, your old behavior was just reload
       window.location.reload();
       return;
     }
-
     if (updating) return;
 
     setUpdating(true);
     try {
-      const handle = updateHandleRef.current;
-
-      // Common pattern: result has downloadAndInstall()
-      if (handle && typeof handle.downloadAndInstall === "function") {
-        await handle.downloadAndInstall();
-      } else {
-        // Other pattern: plugin exports install/update functions
-        const mod = await import("@tauri-apps/plugin-updater");
-        const installFn = mod.installUpdate ?? mod.install ?? mod.downloadAndInstall;
-        if (typeof installFn === "function") {
-          await installFn();
-        }
+      const update = updateHandleRef.current;
+      if (!update || typeof update.downloadAndInstall !== "function") {
+        throw new Error("No update handle available. Try checking for updates again.");
       }
 
-      // Relaunch the app to finish update
-      try {
-        const proc = await import("@tauri-apps/api/process");
-        if (typeof proc.relaunch === "function") {
-          await proc.relaunch();
-          return;
-        }
-      } catch {
-        // ignore
-      }
+      // downloads + installs
+      await update.downloadAndInstall();
 
-      // Worst-case fallback: tell user to close & reopen
-      alert("Update installed. Please close and reopen Momentum AI to finish updating.");
+      // restart app
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (e) {
+      console.error(e);
+      alert(
+        "Update failed to install automatically. Please try again, or download the latest release manually."
+      );
     } finally {
       setUpdating(false);
     }
@@ -218,6 +185,6 @@ export default function useUpdateBanner() {
     lastUpdateCheck,
     CURRENT_VERSION,
     updating,
-    installAndRestart,
+    installAndRestart
   };
 }
