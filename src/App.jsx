@@ -13,6 +13,46 @@ function App() {
   // Status light
   const [status, setStatus] = useState("Idle");
 
+  // ===== UPDATE BANNER =====
+  // Put a file in /public/version.json like: { "version": "1.0.12" }
+  // Bump it each build. App compares to VITE_APP_VERSION (or falls back).
+  const CURRENT_VERSION =
+    (typeof import.meta !== "undefined" && import.meta.env?.VITE_APP_VERSION) ||
+    (typeof window !== "undefined" && window.__APP_VERSION__) ||
+    "0.0.0";
+
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [latestVersion, setLatestVersion] = useState("");
+  const [lastUpdateCheck, setLastUpdateCheck] = useState("");
+
+  async function checkForUpdate() {
+    try {
+      const res = await fetch(`/version.json?ts=${Date.now()}`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const v = String(data?.version || "").trim();
+      if (!v) return;
+
+      setLastUpdateCheck(new Date().toLocaleTimeString());
+      if (v !== CURRENT_VERSION) {
+        setLatestVersion(v);
+        setUpdateAvailable(true);
+      } else {
+        setUpdateAvailable(false);
+        setLatestVersion("");
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  useEffect(() => {
+    checkForUpdate();
+    const id = setInterval(checkForUpdate, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ===== LIVE COACH =====
   const [isListening, setIsListening] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
@@ -60,6 +100,188 @@ function App() {
   // enrollment accumulation refs
   const enrollSumRef = useRef(null);
   const enrollFramesRef = useRef(0);
+
+  // ===== NEW: Guided Enrollment Script + Word Highlight =====
+  const ENROLL_LINES = useMemo(
+    () => [
+      "Hi, this is Momentum Financial calling you back about your request.",
+      "I’m going to ask a few quick questions to see what you qualify for.",
+      "This will only take about a minute, and I’ll keep it simple.",
+      "Do you currently have any life insurance in place today?",
+      "Is that through work, or something you got personally?",
+      "About how much coverage are you wanting to get in place?",
+      "Who would you want listed as the beneficiary?",
+      "Do you use tobacco or nicotine products at all?",
+      "What state are you in, and what’s your date of birth?",
+      "Perfect. If you’re good with it, I’ll go ahead and check options now.",
+    ],
+    []
+  );
+
+  const [enrollLineIndex, setEnrollLineIndex] = useState(0);
+  const [enrollTranscript, setEnrollTranscript] = useState("");
+  const [enrollCompletedCount, setEnrollCompletedCount] = useState(0);
+  const [enrollCompleted, setEnrollCompleted] = useState(() => new Array(10).fill(false));
+  const enrollSRRef = useRef(null);
+  const enrollingRef = useRef(false);
+
+  function normalizeWords(s) {
+    return String(s || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s']/g, "")
+      .split(/\s+/)
+      .filter(Boolean);
+  }
+
+  function computeMatch(expectedLine, spoken) {
+    const e = normalizeWords(expectedLine);
+    const s = normalizeWords(spoken);
+
+    if (!e.length) return { ratio: 0, matchedWordIndexes: [] };
+    if (!s.length) return { ratio: 0, matchedWordIndexes: [] };
+
+    // simple in-order matching (greedy)
+    let si = 0;
+    const matched = [];
+
+    for (let ei = 0; ei < e.length; ei++) {
+      const target = e[ei];
+      while (si < s.length && s[si] !== target) si++;
+      if (si < s.length && s[si] === target) {
+        matched.push(ei);
+        si++;
+      }
+    }
+
+    const ratio = matched.length / e.length;
+    return { ratio, matchedWordIndexes: matched };
+  }
+
+  function renderHighlightedLine(line, spoken) {
+    const words = String(line || "").split(/\s+/);
+    const { matchedWordIndexes } = computeMatch(line, spoken);
+
+    const matchedSet = new Set(matchedWordIndexes);
+    return (
+      <div style={{ lineHeight: 1.35, fontSize: 14, fontWeight: 800 }}>
+        {words.map((w, i) => (
+          <span
+            key={`${w}-${i}`}
+            style={{
+              color: matchedSet.has(i)
+                ? C.emerald
+                : "rgba(237,239,242,0.92)",
+              textShadow: matchedSet.has(i) ? `0 0 14px ${C.emeraldGlow}` : "none",
+              transition: "color 120ms ease",
+            }}
+          >
+            {w}
+            {i < words.length - 1 ? " " : ""}
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  function stopEnrollSpeechRec() {
+    try {
+      const sr = enrollSRRef.current;
+      if (!sr) return;
+      sr.onresult = null;
+      sr.onerror = null;
+      sr.onend = null;
+      sr.stop?.();
+    } catch {}
+    enrollSRRef.current = null;
+  }
+
+  function startEnrollSpeechRec() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return false;
+
+    try {
+      const sr = new SR();
+      sr.continuous = true;
+      sr.interimResults = true;
+      sr.lang = "en-US";
+
+      sr.onresult = (e) => {
+        let full = "";
+        for (let i = 0; i < e.results.length; i++) {
+          full += e.results[i][0]?.transcript ? e.results[i][0].transcript + " " : "";
+        }
+        full = full.trim();
+        setEnrollTranscript(full);
+
+        // auto-advance line when match is strong
+        const currentLine = ENROLL_LINES[enrollLineIndex] || "";
+        const { ratio } = computeMatch(currentLine, full);
+
+        // Threshold tuned so it feels “natural” (not perfect dictation)
+        const DONE_AT = 0.82;
+
+        if (ratio >= DONE_AT) {
+          setEnrollCompleted((prev) => {
+            const next = [...prev];
+            if (!next[enrollLineIndex]) next[enrollLineIndex] = true;
+            return next;
+          });
+
+          setEnrollCompletedCount((prev) => {
+            // count will be corrected by effect below, but this keeps UI snappy
+            return Math.min(10, prev + 1);
+          });
+
+          // move to next line (or loop if finished early)
+          setEnrollLineIndex((idx) => {
+            const next = idx + 1;
+            if (next >= ENROLL_LINES.length) return 0;
+            return next;
+          });
+
+          // clear transcript so next line starts fresh
+          setEnrollTranscript("");
+          try {
+            // reset internal results buffer
+            sr.abort?.();
+            // restart right away if still enrolling
+            setTimeout(() => {
+              if (enrollingRef.current) {
+                try {
+                  sr.start?.();
+                } catch {}
+              }
+            }, 120);
+          } catch {}
+        }
+      };
+
+      sr.onerror = () => {
+        // speech recognition can be finicky; just keep enrollment going
+      };
+
+      sr.onend = () => {
+        if (enrollingRef.current) {
+          try {
+            sr.start?.();
+          } catch {}
+        }
+      };
+
+      sr.start();
+      enrollSRRef.current = sr;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  useEffect(() => {
+    // keep completed count accurate
+    const count = enrollCompleted.filter(Boolean).length;
+    setEnrollCompletedCount(count);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enrollCompleted]);
 
   // ===== RECORDER =====
   const [isRecording, setIsRecording] = useState(false);
@@ -141,6 +363,12 @@ function App() {
   const [rpAgentText, setRpAgentText] = useState("");
   const [rpFeedback, setRpFeedback] = useState(null);
   const [rpTurn, setRpTurn] = useState(0);
+
+  // NEW: Roleplay call flow + voice-first agent
+  const [rpCallState, setRpCallState] = useState("idle"); // idle | ringing | answered | ended
+  const [rpAgentInputMode, setRpAgentInputMode] = useState("voice"); // voice | type
+  const [rpAgentListening, setRpAgentListening] = useState(false);
+  const rpSRRef = useRef(null);
 
   // Add custom objection
   const [customClient, setCustomClient] = useState("");
@@ -557,14 +785,24 @@ function App() {
 
   // ---------- Enrollment (local-only, required per mic) ----------
   function stopEnrollmentHard() {
+    enrollingRef.current = false;
+    stopEnrollSpeechRec();
+
     if (enrollStopRef.current) {
-      try { enrollStopRef.current(); } catch {}
+      try {
+        enrollStopRef.current();
+      } catch {}
       enrollStopRef.current = null;
     }
     setEnrolling(false);
     setEnrollSecondsLeft(60);
     enrollSumRef.current = null;
     enrollFramesRef.current = 0;
+
+    setEnrollLineIndex(0);
+    setEnrollTranscript("");
+    setEnrollCompleted(new Array(10).fill(false));
+    setEnrollCompletedCount(0);
   }
 
   async function startEnrollment60s() {
@@ -580,9 +818,19 @@ function App() {
     }
 
     setEnrolling(true);
+    enrollingRef.current = true;
+
     setEnrollSecondsLeft(60);
     setDetectedSpeaker("Unknown");
     setVoiceSimilarity(0);
+
+    setEnrollLineIndex(0);
+    setEnrollTranscript("");
+    setEnrollCompleted(new Array(10).fill(false));
+    setEnrollCompletedCount(0);
+
+    // Start speech recognition (for highlighting) if supported
+    startEnrollSpeechRec();
 
     let stream = null;
     let ctx = null;
@@ -678,8 +926,15 @@ function App() {
         // stop capture
         if (raf) cancelAnimationFrame(raf);
 
-        try { stream?.getTracks()?.forEach((t) => t.stop()); } catch {}
-        try { ctx?.close?.(); } catch {}
+        try {
+          stream?.getTracks()?.forEach((t) => t.stop());
+        } catch {}
+        try {
+          ctx?.close?.();
+        } catch {}
+
+        enrollingRef.current = false;
+        stopEnrollSpeechRec();
 
         // build final voiceprint
         let vec = null;
@@ -699,7 +954,7 @@ function App() {
 
         if (!vec) {
           setStatus("Enrollment failed");
-          setSayThisNext("Not enough clear speech captured. Try again and read the script louder.");
+          setSayThisNext("Not enough clear speech captured. Try again and read the lines louder.");
           return;
         }
 
@@ -717,8 +972,16 @@ function App() {
 
       enrollStopRef.current = () => {
         if (raf) cancelAnimationFrame(raf);
-        try { stream?.getTracks()?.forEach((t) => t.stop()); } catch {}
-        try { ctx?.close?.(); } catch {}
+        try {
+          stream?.getTracks()?.forEach((t) => t.stop());
+        } catch {}
+        try {
+          ctx?.close?.();
+        } catch {}
+
+        enrollingRef.current = false;
+        stopEnrollSpeechRec();
+
         setEnrolling(false);
         setEnrollSecondsLeft(60);
         setMicLevel(0);
@@ -823,13 +1086,72 @@ function App() {
     a.remove();
   }
 
-  // ---------- ROLEPLAY ----------
+  // ---------- ROLEPLAY: Female Voice Selection ----------
+  const preferredVoiceRef = useRef(null);
+
+  function chooseFemaleVoice() {
+    try {
+      const voices = window.speechSynthesis?.getVoices?.() || [];
+      if (!voices.length) return null;
+
+      const isEnglish = (v) => /en(-|_)?/i.test(v.lang || "");
+      const name = (v) => String(v.name || "").toLowerCase();
+
+      const femaleHints = [
+        "female",
+        "samantha",
+        "victoria",
+        "karen",
+        "tessa",
+        "moira",
+        "serena",
+        "zira",
+        "ava",
+        "allison",
+        "emma",
+        "olivia",
+        "natalie",
+        "joanna",
+      ];
+
+      // 1) explicit/obvious female voice names
+      let pick =
+        voices.find((v) => isEnglish(v) && femaleHints.some((h) => name(v).includes(h))) ||
+        voices.find((v) => femaleHints.some((h) => name(v).includes(h))) ||
+        null;
+
+      // 2) fallback to an English voice (often female on many systems)
+      if (!pick) pick = voices.find((v) => isEnglish(v)) || voices[0] || null;
+
+      preferredVoiceRef.current = pick;
+      return pick;
+    } catch {
+      return null;
+    }
+  }
+
+  useEffect(() => {
+    // Voices load async in many browsers
+    chooseFemaleVoice();
+    const handler = () => chooseFemaleVoice();
+    window.speechSynthesis?.addEventListener?.("voiceschanged", handler);
+    return () => window.speechSynthesis?.removeEventListener?.("voiceschanged", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function speak(text) {
     if (!rpVoiceOn) return;
     try {
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.0;
-      u.pitch = 1.0;
+
+      // less robotic feel
+      u.rate = 1.02;
+      u.pitch = 0.95;
+      u.volume = 1;
+
+      const v = preferredVoiceRef.current || chooseFemaleVoice();
+      if (v) u.voice = v;
+
       window.speechSynthesis.cancel();
       window.speechSynthesis.speak(u);
     } catch {}
@@ -842,29 +1164,7 @@ function App() {
         .map(([k]) => k)
     );
 
-    return allObjections.filter(
-      (o) => allowedCats.has(o.category) && o.difficulty <= rpDifficulty
-    );
-  }
-
-  function startRoleplay() {
-    setRpRunning(true);
-    setRpTurn(0);
-    setRpFeedback(null);
-    setRpAgentText("");
-
-    const opening = "Hi — is this you? I’m just calling you back about the form you filled out.";
-    setRpClientLine(opening);
-    speak(opening);
-
-    const pool = filteredObjections();
-    if (pool.length === 0) return;
-  }
-
-  function endRoleplay(hangupText) {
-    setRpRunning(false);
-    setRpFeedback({ hangup: true, note: hangupText, score: 0, best: "" });
-    speak(hangupText);
+    return allObjections.filter((o) => allowedCats.has(o.category) && o.difficulty <= rpDifficulty);
   }
 
   function scoreResponse(userText, bestText) {
@@ -909,23 +1209,163 @@ function App() {
     return pool[Math.floor(Math.random() * pool.length)];
   }
 
+  // ---------- ROLEPLAY: Ringing sound (WebAudio) ----------
+  const ringCtxRef = useRef(null);
+  const ringGainRef = useRef(null);
+  const ringOscRef = useRef(null);
+  const ringIntervalRef = useRef(null);
+
+  function ringStart() {
+    try {
+      ringStop();
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioContext();
+      ringCtxRef.current = ctx;
+
+      const gain = ctx.createGain();
+      gain.gain.value = 0.0;
+      gain.connect(ctx.destination);
+      ringGainRef.current = gain;
+
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.value = 440;
+      osc.connect(gain);
+      osc.start();
+      ringOscRef.current = osc;
+
+      // classic ring: on 1.1s, off 2s
+      let on = false;
+      const pulse = () => {
+        on = !on;
+        gain.gain.setTargetAtTime(on ? 0.18 : 0.0, ctx.currentTime, 0.02);
+        osc.frequency.setTargetAtTime(on ? 440 : 0, ctx.currentTime, 0.02);
+      };
+
+      pulse();
+      ringIntervalRef.current = setInterval(pulse, 1100);
+    } catch {
+      // ignore
+    }
+  }
+
+  function ringStop() {
+    try {
+      if (ringIntervalRef.current) clearInterval(ringIntervalRef.current);
+      ringIntervalRef.current = null;
+
+      if (ringGainRef.current) {
+        ringGainRef.current.gain.setTargetAtTime(0, ringCtxRef.current?.currentTime || 0, 0.01);
+      }
+      ringOscRef.current?.stop?.();
+      ringOscRef.current = null;
+
+      ringCtxRef.current?.close?.();
+      ringCtxRef.current = null;
+      ringGainRef.current = null;
+    } catch {}
+  }
+
+  // ---------- ROLEPLAY: Agent speech-to-text ----------
+  function stopRoleplaySpeechRec() {
+    try {
+      const sr = rpSRRef.current;
+      if (!sr) return;
+      sr.onresult = null;
+      sr.onerror = null;
+      sr.onend = null;
+      sr.stop?.();
+    } catch {}
+    rpSRRef.current = null;
+    setRpAgentListening(false);
+  }
+
+  async function startRoleplaySpeechRec() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return false;
+
+    const ok = permissionState === "granted" ? true : await ensureMicPermission();
+    if (!ok) return false;
+
+    try {
+      const sr = new SR();
+      sr.continuous = true;
+      sr.interimResults = true;
+      sr.lang = "en-US";
+
+      sr.onresult = (e) => {
+        let full = "";
+        for (let i = 0; i < e.results.length; i++) {
+          full += e.results[i][0]?.transcript ? e.results[i][0].transcript + " " : "";
+        }
+        setRpAgentText(full.trim());
+      };
+
+      sr.onerror = () => {
+        // keep it simple; user can switch to typing
+      };
+
+      sr.onend = () => {
+        setRpAgentListening(false);
+      };
+
+      sr.start();
+      rpSRRef.current = sr;
+      setRpAgentListening(true);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // NEW ROLEPLAY FLOW:
+  // - start: ring -> answered
+  // - agent talks first (voice or type)
+  // - when agent submits, client responds (female voice)
+  function startRoleplay() {
+    setRpRunning(true);
+    setRpTurn(0);
+    setRpFeedback(null);
+    setRpAgentText("");
+    setRpClientLine("");
+
+    setRpCallState("ringing");
+    ringStart();
+
+    const delay = 2000 + Math.floor(Math.random() * 1200);
+    setTimeout(() => {
+      ringStop();
+      setRpCallState("answered");
+      // Agent speaks first. We DO NOT set any client line here.
+    }, delay);
+  }
+
+  function endRoleplay(hangupText) {
+    setRpRunning(false);
+    setRpCallState("ended");
+    ringStop();
+    stopRoleplaySpeechRec();
+    setRpAgentListening(false);
+    setRpFeedback({ hangup: true, note: hangupText, score: 0, best: "" });
+    speak(hangupText);
+  }
+
   function submitRoleplay() {
     if (!rpRunning) return;
 
     const user = rpAgentText.trim();
     if (!user) return;
 
+    // First turn: agent speaks first, then client responds
     const next = nextClientLineFromPool();
     const score = scoreResponse(user, next.best);
 
-    const hangupChance =
-      rpDifficulty === 1 ? 0.05 : rpDifficulty === 2 ? 0.12 : 0.22;
-
+    const hangupChance = rpDifficulty === 1 ? 0.05 : rpDifficulty === 2 ? 0.12 : 0.22;
     const tooWeak = score < (rpDifficulty === 3 ? 35 : 25);
     const rng = Math.random();
 
     if (tooWeak && rng < hangupChance) {
-      endRoleplay("Alright man — I’m not doing all that. I’ll call back later.");
+      endRoleplay("Alright — I’m not doing all that. I’ll call back later.");
       return;
     }
 
@@ -942,9 +1382,15 @@ function App() {
     });
 
     setRpTurn((t) => t + 1);
+
     setRpClientLine(next.client);
+    // Always client speaks after agent
     speak(next.client);
+
+    // clear agent for next response
     setRpAgentText("");
+    stopRoleplaySpeechRec();
+    setRpAgentListening(false);
   }
 
   function addCustomObjection() {
@@ -987,39 +1433,84 @@ function App() {
           <div
             style={{
               display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: 12,
+              flexDirection: "column",
+              gap: 10,
               marginBottom: 14,
             }}
           >
-            <div style={{ fontSize: 28, fontWeight: 950, letterSpacing: 0.2 }}>
-              Momentum <span style={{ color: C.emerald }}>AI</span>
-            </div>
-
+            {/* Top header row */}
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 10,
-                padding: "8px 10px",
-                borderRadius: 14,
-                background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
-                border: `1px solid ${C.border}`,
+                justifyContent: "space-between",
+                gap: 12,
               }}
             >
-              <div style={{ fontSize: 12, color: C.muted }}>Status</div>
-              <div style={{ fontSize: 12, fontWeight: 900 }}>{status}</div>
+              <div style={{ fontSize: 28, fontWeight: 950, letterSpacing: 0.2 }}>
+                Momentum <span style={{ color: C.emerald }}>AI</span>
+              </div>
+
               <div
                 style={{
-                  width: 10,
-                  height: 10,
-                  borderRadius: 999,
-                  background: isListening || isRecording || enrolling ? C.emerald : "rgba(255,255,255,0.20)",
-                  boxShadow: isListening || isRecording || enrolling ? `0 0 18px ${C.emeraldGlow}` : "none",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "8px 10px",
+                  borderRadius: 14,
+                  background: `linear-gradient(180deg, ${C.panel}, ${C.panel2})`,
+                  border: `1px solid ${C.border}`,
                 }}
-              />
+              >
+                <div style={{ fontSize: 12, color: C.muted }}>Status</div>
+                <div style={{ fontSize: 12, fontWeight: 900 }}>{status}</div>
+                <div
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: 999,
+                    background:
+                      isListening || isRecording || enrolling ? C.emerald : "rgba(255,255,255,0.20)",
+                    boxShadow:
+                      isListening || isRecording || enrolling ? `0 0 18px ${C.emeraldGlow}` : "none",
+                  }}
+                />
+              </div>
             </div>
+
+            {/* Update banner */}
+            {updateAvailable && (
+              <div
+                style={{
+                  borderRadius: 14,
+                  border: `1px solid rgba(16,185,129,0.35)`,
+                  background: "rgba(16,185,129,0.12)",
+                  padding: 10,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 900 }}>
+                  Update available{" "}
+                  <span style={{ color: C.emerald }}>
+                    {latestVersion ? `v${latestVersion}` : ""}
+                  </span>
+                  <div style={{ fontSize: 11, color: "rgba(237,239,242,0.75)", marginTop: 2 }}>
+                    Current: v{CURRENT_VERSION}
+                    {lastUpdateCheck ? ` • checked ${lastUpdateCheck}` : ""}
+                  </div>
+                </div>
+                <button
+                  className="btn"
+                  onClick={() => window.location.reload()}
+                  style={{ whiteSpace: "nowrap" }}
+                >
+                  Reload
+                </button>
+              </div>
+            )}
           </div>
 
           {children}
@@ -1088,7 +1579,7 @@ function App() {
       },
       {
         title: "Roleplay Trainer",
-        desc: "Start roleplay. Pick difficulty + categories (Banking/Social included).",
+        desc: "Ringing → Answered. YOU talk first. Client voice is always female.",
         onClick: () => setView("roleplay"),
       },
     ];
@@ -1110,8 +1601,8 @@ function App() {
           <ol className="howList">
             <li>Select your microphone.</li>
             <li>Live Coach requires a 60-second voice enrollment (local-only) for that mic.</li>
+            <li>Enrollment now guides you through 10 lines with live highlighting.</li>
             <li>Momentum AI detects Agent vs Client by matching your voiceprint.</li>
-            <li>Suggestions trigger only after the CLIENT finishes talking + a short pause.</li>
           </ol>
           <div className="howNote">
             Note: This is a lightweight local voice “fingerprint,” not bank-grade biometric security.
@@ -1123,8 +1614,6 @@ function App() {
 
   // ---------- LIVE ----------
   if (view === "live") {
-    const enrolledVec = getEnrolledVec(selectedDeviceId);
-
     return (
       <Shell>
         {BackBar("Live Coach")}
@@ -1138,16 +1627,49 @@ function App() {
               <div className="panelTitle">Voice Enrollment Required</div>
 
               <div className="smallMuted" style={{ marginTop: 0 }}>
-                This is per mic device. You’ll read the script out loud for 60 seconds so Momentum AI can detect
-                when it’s YOU talking vs the client (local-only).
+                Read each line out loud. It highlights as you speak and auto-advances.
+                If you finish all 10 lines before 60 seconds, it loops back so you can keep talking.
               </div>
 
               <div className="sayBox" style={{ marginTop: 10 }}>
-                Read this naturally for 60 seconds:
-                {"\n\n"}
-                “Hi, this is Momentum Financial. I’m calling you back about the life insurance request you sent in.
-                I’m going to ask a few quick questions and see what you can qualify for. This will only take a minute.
-                If you’re driving or busy, tell me a better time and I’ll call back.”
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ fontWeight: 950 }}>
+                    Line {enrollLineIndex + 1}/10{" "}
+                    <span style={{ color: C.emerald }}>
+                      • {enrollCompletedCount}/10 complete
+                    </span>
+                  </div>
+                  <div style={{ fontWeight: 900, color: "rgba(237,239,242,0.75)" }}>
+                    {enrolling ? (
+                      <>
+                        <span style={{ color: C.emerald }}>{enrollSecondsLeft}s</span> left
+                      </>
+                    ) : (
+                      "Ready"
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 10 }}>
+                  {renderHighlightedLine(ENROLL_LINES[enrollLineIndex], enrollTranscript)}
+                </div>
+
+                <div style={{ marginTop: 10, fontSize: 12, color: "rgba(237,239,242,0.70)" }}>
+                  {(() => {
+                    const { ratio } = computeMatch(
+                      ENROLL_LINES[enrollLineIndex],
+                      enrollTranscript
+                    );
+                    const pct = Math.round(ratio * 100);
+                    return (
+                      <>
+                        Match:{" "}
+                        <span style={{ color: C.emerald, fontWeight: 950 }}>{pct}%</span>
+                        {"  "}• (If your browser doesn’t support speech recognition, highlighting won’t work.)
+                      </>
+                    );
+                  })()}
+                </div>
               </div>
 
               <div style={{ marginTop: 12 }}>
@@ -1157,12 +1679,6 @@ function App() {
                 <div className="meter">
                   <div className="meterFill" style={{ width: `${micLevel}%` }} />
                 </div>
-
-                {enrolling && (
-                  <div className="smallMuted" style={{ marginTop: 8 }}>
-                    Enrolling… <span style={{ color: C.emerald, fontWeight: 950 }}>{enrollSecondsLeft}s</span> left
-                  </div>
-                )}
               </div>
 
               <div className="row2" style={{ marginTop: 12 }}>
@@ -1175,7 +1691,7 @@ function App() {
               </div>
 
               <div className="smallMuted">
-                After enrollment, Live Coach will unlock automatically for this mic.
+                After enrollment, Live Coach unlocks automatically for this mic.
               </div>
             </div>
           ) : (
@@ -1244,7 +1760,7 @@ function App() {
           <div className="panelTitle">SAY THIS NEXT</div>
           <div className="sayBox">{sayThisNext}</div>
           <div className="smallMuted">
-            This now triggers only after the <b>CLIENT</b> finishes talking (based on your enrolled voiceprint).
+            Triggers only after the <b>CLIENT</b> finishes talking (based on your enrolled voiceprint).
           </div>
         </div>
       </Shell>
@@ -1345,7 +1861,7 @@ function App() {
                 value={rpVoiceOn ? "on" : "off"}
                 onChange={(e) => setRpVoiceOn(e.target.value === "on")}
               >
-                <option value="on">Voice ON</option>
+                <option value="on">Female Voice ON</option>
                 <option value="off">Voice OFF</option>
               </select>
             </div>
@@ -1369,6 +1885,24 @@ function App() {
           </div>
 
           <div style={{ marginTop: 12 }}>
+            <div className="smallMuted" style={{ marginTop: 0 }}>
+              Agent input
+            </div>
+            <select
+              className="field"
+              value={rpAgentInputMode}
+              onChange={(e) => {
+                const v = e.target.value;
+                setRpAgentInputMode(v);
+                if (v === "type") stopRoleplaySpeechRec();
+              }}
+            >
+              <option value="voice">Voice (speech-to-text)</option>
+              <option value="type">Type</option>
+            </select>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
             {!rpRunning ? (
               <button className="btnOutline" onClick={startRoleplay}>
                 START ROLEPLAY
@@ -1377,7 +1911,10 @@ function App() {
               <button
                 className="btnOutlineDim"
                 onClick={() => {
+                  ringStop();
+                  stopRoleplaySpeechRec();
                   setRpRunning(false);
+                  setRpCallState("idle");
                   setRpClientLine("");
                   setRpFeedback(null);
                   setRpAgentText("");
@@ -1391,25 +1928,84 @@ function App() {
 
         {rpRunning && (
           <div className="panel" style={{ marginTop: 12 }}>
-            <div className="panelTitle">Client says</div>
-            <div className="sayBox">{rpClientLine}</div>
+            {/* Call status */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+              <div className="panelTitle">Call</div>
+              <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 950,
+                  padding: "6px 10px",
+                  borderRadius: 999,
+                  border: `1px solid ${C.border}`,
+                  background:
+                    rpCallState === "answered"
+                      ? "rgba(16,185,129,0.14)"
+                      : "rgba(255,255,255,0.06)",
+                  color: rpCallState === "answered" ? C.emerald : "rgba(237,239,242,0.75)",
+                }}
+              >
+                {rpCallState === "ringing" ? "Ringing…" : rpCallState === "answered" ? "Answered" : "Ended"}
+              </div>
+            </div>
 
+            {/* Client speaks box */}
+            <div style={{ marginTop: 10 }}>
+              <div className="smallMuted" style={{ marginTop: 0 }}>
+                Client says
+              </div>
+              <div className="sayBox">
+                {rpCallState !== "answered"
+                  ? "…"
+                  : rpClientLine
+                  ? rpClientLine
+                  : "— (You talk first. Do your own intro, then submit.)"}
+              </div>
+            </div>
+
+            {/* Agent input */}
             <div style={{ marginTop: 12 }}>
               <div className="smallMuted" style={{ marginTop: 0 }}>
-                Your response (type it — we’ll add speech-to-text later if you want)
+                Your response ({rpAgentInputMode === "voice" ? "voice → auto text" : "type"})
               </div>
+
+              {rpAgentInputMode === "voice" ? (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    className="btn"
+                    disabled={rpAgentListening || rpCallState !== "answered"}
+                    onClick={startRoleplaySpeechRec}
+                    style={{ whiteSpace: "nowrap" }}
+                  >
+                    {rpAgentListening ? "Listening…" : "Start talking"}
+                  </button>
+                  <button
+                    className="btnOutlineDim"
+                    disabled={!rpAgentListening}
+                    onClick={stopRoleplaySpeechRec}
+                    style={{ whiteSpace: "nowrap" }}
+                  >
+                    Stop
+                  </button>
+                </div>
+              ) : null}
+
               <textarea
                 className="field"
-                style={{ minHeight: 110, resize: "none" }}
+                style={{ minHeight: 110, resize: "none", marginTop: 10 }}
                 value={rpAgentText}
                 onChange={(e) => setRpAgentText(e.target.value)}
-                placeholder="Type what you would say…"
+                placeholder={
+                  rpAgentInputMode === "voice"
+                    ? "Your speech will appear here…"
+                    : "Type what you would say…"
+                }
               />
             </div>
 
             <div className="row2" style={{ marginTop: 10 }}>
-              <button className="btnOutline" onClick={submitRoleplay} disabled={!rpAgentText.trim()}>
-                SUBMIT
+              <button className="btnOutline" onClick={submitRoleplay} disabled={!rpAgentText.trim() || rpCallState !== "answered"}>
+                SUBMIT (Client responds)
               </button>
               <button
                 className="btnOutlineDim"
@@ -1419,8 +2015,9 @@ function App() {
                   speak(next.client);
                   setRpFeedback(null);
                 }}
+                disabled={rpCallState !== "answered"}
               >
-                SKIP / NEXT
+                FORCE NEXT CLIENT LINE
               </button>
             </div>
 
