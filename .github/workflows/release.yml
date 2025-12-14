@@ -10,36 +10,52 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  publish:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - platform: windows-latest
+            args: ""
+          # Build both mac architectures so Intel Macs can install too.
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node
       - uses: actions/setup-node@v4
         with:
           node-version: lts/*
+          cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
 
       - name: Install deps
-        run: npm install
+        run: npm ci
 
-      - name: Build Tauri app
-        run: npm run tauri build
-
-      - name: Upload bundles (artifacts)
-        uses: actions/upload-artifact@v4
+      - name: Build + publish (Tauri)
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          name: MomentumAI-${{ matrix.os }}
-          path: src-tauri/target/release/bundle/**
-
-      - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            src-tauri/target/release/bundle/**/*
+          tagName: v__VERSION__
+          releaseName: "Momentum AI v__VERSION__"
+          releaseBody: "See the assets to download and install this version."
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}
