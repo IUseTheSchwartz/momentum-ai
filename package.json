@@ -4,10 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "predev": "node scripts/write-version.mjs",
-    "dev": "vite",
-    "prebuild": "node scripts/write-version.mjs",
-    "build": "vite build",
+    "gen:version": "node scripts/gen-version.mjs",
+    "dev": "npm run gen:version && vite",
+    "build": "npm run gen:version && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
