@@ -85,10 +85,24 @@ export default function LiveCoach({
   const enrollSRRef = useRef(null);
   const enrollingRef = useRef(false);
 
+  // ✅ FIX: keep current line index in a ref so SpeechRecognition never reads stale state
+  const enrollLineIndexRef = useRef(0);
+  useEffect(() => {
+    enrollLineIndexRef.current = enrollLineIndex;
+  }, [enrollLineIndex]);
+
+  // ✅ FIX: prevent double-advance spam
+  const lastAdvanceMsRef = useRef(0);
+
+  // ✅ FIX: normalize both ’ and ' the same (remove apostrophes entirely)
   function normalizeWords(s) {
     return String(s || "")
       .toLowerCase()
-      .replace(/[^a-z0-9\s']/g, "")
+      // normalize curly apostrophes/quotes to straight, then remove apostrophes
+      .replace(/[’‘]/g, "'")
+      .replace(/'/g, "")
+      // strip everything except letters/numbers/spaces
+      .replace(/[^a-z0-9\s]/g, "")
       .split(/\s+/)
       .filter(Boolean);
   }
@@ -156,6 +170,9 @@ export default function LiveCoach({
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return false;
 
+    // always start clean
+    stopEnrollSpeechRec();
+
     try {
       const sr = new SR();
       sr.continuous = true;
@@ -163,6 +180,7 @@ export default function LiveCoach({
       sr.lang = "en-US";
 
       sr.onresult = (e) => {
+        // Build transcript text (ok to be "full", match is subsequence-based)
         let full = "";
         for (let i = 0; i < e.results.length; i++) {
           full += e.results[i][0]?.transcript ? e.results[i][0].transcript + " " : "";
@@ -170,45 +188,51 @@ export default function LiveCoach({
         full = full.trim();
         setEnrollTranscript(full);
 
-        const currentLine = ENROLL_LINES[enrollLineIndex] || "";
+        const idx = enrollLineIndexRef.current;
+        const currentLine = ENROLL_LINES[idx] || "";
         const { ratio } = computeMatch(currentLine, full);
 
         const DONE_AT = 0.82;
 
-        if (ratio >= DONE_AT) {
+        // ✅ debounce advance
+        const now = Date.now();
+        if (ratio >= DONE_AT && now - lastAdvanceMsRef.current > 700) {
+          lastAdvanceMsRef.current = now;
+
           setEnrollCompleted((prev) => {
             const next = [...prev];
-            if (!next[enrollLineIndex]) next[enrollLineIndex] = true;
+            if (!next[idx]) next[idx] = true;
             return next;
           });
 
-          setEnrollLineIndex((idx) => {
-            const next = idx + 1;
-            if (next >= ENROLL_LINES.length) return 0;
-            return next;
+          // advance line + update ref in the setter (no stale)
+          setEnrollLineIndex((prevIdx) => {
+            const nextIdx = prevIdx + 1 >= ENROLL_LINES.length ? 0 : prevIdx + 1;
+            enrollLineIndexRef.current = nextIdx;
+            return nextIdx;
           });
 
           setEnrollTranscript("");
 
-          try {
-            sr.abort?.();
-            setTimeout(() => {
-              if (enrollingRef.current) {
-                try {
-                  sr.start?.();
-                } catch {}
-              }
-            }, 120);
-          } catch {}
+          // ✅ FIX: restart recognition cleanly so results reset & it keeps listening
+          stopEnrollSpeechRec();
+          setTimeout(() => {
+            if (enrollingRef.current) startEnrollSpeechRec();
+          }, 180);
         }
       };
 
       sr.onerror = () => {};
       sr.onend = () => {
+        // keep it running during enrollment
         if (enrollingRef.current) {
-          try {
-            sr.start?.();
-          } catch {}
+          setTimeout(() => {
+            if (enrollingRef.current) {
+              try {
+                sr.start?.();
+              } catch {}
+            }
+          }, 120);
         }
       };
 
@@ -583,6 +607,9 @@ export default function LiveCoach({
     setVoiceSimilarity(0);
 
     setEnrollLineIndex(0);
+    enrollLineIndexRef.current = 0;
+    lastAdvanceMsRef.current = 0;
+
     setEnrollTranscript("");
     setEnrollCompleted(new Array(10).fill(false));
     setEnrollCompletedCount(0);
@@ -803,7 +830,9 @@ export default function LiveCoach({
                 </div>
               </div>
 
-              <div style={{ marginTop: 10 }}>{renderHighlightedLine(ENROLL_LINES[enrollLineIndex], enrollTranscript)}</div>
+              <div style={{ marginTop: 10 }}>
+                {renderHighlightedLine(ENROLL_LINES[enrollLineIndex], enrollTranscript)}
+              </div>
 
               <div style={{ marginTop: 10, fontSize: 12, color: "rgba(237,239,242,0.70)" }}>
                 {(() => {
