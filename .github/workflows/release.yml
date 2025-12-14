@@ -4,15 +4,18 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "v*.*.*"
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
-  build-and-release:
+  build:
     strategy:
       fail-fast: false
       matrix:
-        platform: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.platform }}
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -26,15 +29,17 @@ jobs:
       - name: Install deps
         run: npm install
 
-      - name: Build + publish Tauri release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      - name: Build Tauri app
+        run: npm run tauri build
+
+      - name: Upload bundles (artifacts)
+        uses: actions/upload-artifact@v4
         with:
-          tagName: v__VERSION__
-          releaseName: "Momentum AI v__VERSION__"
-          releaseBody: "Auto-generated release."
-          releaseDraft: false
-          prerelease: false
+          name: MomentumAI-${{ matrix.os }}
+          path: src-tauri/target/release/bundle/**
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/**/*
