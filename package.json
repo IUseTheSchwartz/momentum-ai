@@ -1,12 +1,10 @@
 {
   "name": "tauri-appmomentum-ai",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "predev": "node scripts/write-version.mjs",
     "dev": "vite",
-    "prebuild": "node scripts/write-version.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri"
@@ -14,7 +12,6 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-process": "^2",
     "@tauri-apps/plugin-updater": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
