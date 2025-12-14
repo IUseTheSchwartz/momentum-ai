@@ -1,105 +1,38 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const host = process.env.TAURI_DEV_HOST;
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-function readJsonSafe(p) {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf-8"));
-  } catch {
-    return null;
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Momentum AI",
+  "version": "0.1.0",
+  "identifier": "com.momentum.ai",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Momentum AI",
+        "width": 430,
+        "height": 820,
+        "resizable": true,
+        "minWidth": 390,
+        "minHeight": 720
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }
-
-function readAppVersion() {
-  // Prefer Tauri version (what you actually ship)
-  const tauriConfPath = path.resolve(__dirname, "src-tauri", "tauri.conf.json");
-  const tauriConf = readJsonSafe(tauriConfPath);
-
-  // Tauri v2 shape: { version: "x.y.z" }
-  const v2 = tauriConf?.version;
-  if (v2) return String(v2);
-
-  // Some older examples: { package: { version: "x.y.z" } }
-  const legacy = tauriConf?.package?.version;
-  if (legacy) return String(legacy);
-
-  // Fallback: package.json
-  const pkgPath = path.resolve(__dirname, "package.json");
-  const pkg = readJsonSafe(pkgPath);
-  const pkgVersion = pkg?.version;
-  if (pkgVersion) return String(pkgVersion);
-
-  return "0.0.0";
-}
-
-function writeVersionJson(version) {
-  const publicDir = path.resolve(__dirname, "public");
-  if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
-
-  const payload = {
-    version,
-    builtAt: new Date().toISOString(),
-  };
-
-  fs.writeFileSync(
-    path.join(publicDir, "version.json"),
-    JSON.stringify(payload, null, 2),
-    "utf-8"
-  );
-}
-
-function emitVersionJsonPlugin(version) {
-  return {
-    name: "emit-version-json",
-    // Runs in both dev + build
-    configResolved() {
-      writeVersionJson(version);
-    },
-    buildStart() {
-      writeVersionJson(version);
-    },
-    configureServer() {
-      writeVersionJson(version);
-    },
-  };
-}
-
-// https://vite.dev/config/
-export default defineConfig(async () => {
-  const version = readAppVersion();
-
-  return {
-    plugins: [react(), emitVersionJsonPlugin(version)],
-
-    // Lets you read it as:
-    // const v = import.meta.env.VITE_APP_VERSION
-    define: {
-      "import.meta.env.VITE_APP_VERSION": JSON.stringify(version),
-    },
-
-    clearScreen: false,
-
-    server: {
-      port: 1420,
-      strictPort: true,
-      host: host || false,
-      hmr: host
-        ? {
-            protocol: "ws",
-            host,
-            port: 1421,
-          }
-        : undefined,
-      watch: {
-        ignored: ["**/src-tauri/**"],
-      },
-    },
-  };
-});
