@@ -41,7 +41,7 @@ function formatCheckTime(d = new Date()) {
       month: "short",
       day: "2-digit",
       hour: "2-digit",
-      minute: "2-digit"
+      minute: "2-digit",
     });
   } catch {
     return "";
@@ -56,7 +56,7 @@ async function fetchWithTimeout(url, ms = 5000) {
     const res = await fetch(url, {
       cache: "no-store",
       signal: ctrl.signal,
-      headers: { "cache-control": "no-cache" }
+      headers: { "cache-control": "no-cache" },
     });
     return res;
   } finally {
@@ -92,29 +92,30 @@ export default function useUpdateBanner() {
 
       // --- REAL Tauri updater path ---
       if (isTauri()) {
-        const { check } = await import("@tauri-apps/plugin-updater");
-        const update = await check(); // Update | null
+        const mod = await import("@tauri-apps/plugin-updater");
+        const checkFn = mod.check ?? mod.checkUpdate; // support either export
+        if (typeof checkFn !== "function") return;
 
-        // Per v2 docs: null means no update available.
+        const update = await checkFn(); // Update | null
+
+        // null means no update available
         if (update) {
           updateHandleRef.current = update;
 
           const remoteVersion = normalize(update.version || "");
           if (remoteVersion) setLatestVersion(remoteVersion);
 
-          // If you want a safety compare, keep it; otherwise update != null is enough.
+          // safety compare (optional). If no version, still show the banner.
           if (!remoteVersion || compareSemver(remoteVersion, CURRENT_VERSION) > 0) {
             setUpdateAvailable(true);
             stoppedRef.current = true;
           }
-          return;
         }
 
-        // no update
         return;
       }
 
-      // --- Browser fallback (only useful if version.json is hosted remotely) ---
+      // --- Browser fallback (ONLY useful if version.json is hosted remotely) ---
       const res = await fetchWithTimeout(`/version.json?ts=${Date.now()}`, 5000);
       if (!res || !res.ok) return;
 
@@ -152,7 +153,7 @@ export default function useUpdateBanner() {
       // downloads + installs
       await update.downloadAndInstall();
 
-      // restart app
+      // restart app (Tauri v2 plugin-process)
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (e) {
@@ -185,6 +186,6 @@ export default function useUpdateBanner() {
     lastUpdateCheck,
     CURRENT_VERSION,
     updating,
-    installAndRestart
+    installAndRestart,
   };
 }
