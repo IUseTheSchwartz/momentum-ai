@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { C } from "../theme";
 import BackBar from "../components/BackBar";
 import MicBlock from "../components/MicBlock";
+import { aiBrainTurn } from "../ai/brain";
 
 export default function LiveCoach({
   setView,
@@ -27,12 +28,18 @@ export default function LiveCoach({
     const v = Number(localStorage.getItem("momentum_ai_voice_threshold") || "0.88");
     return Number.isFinite(v) ? v : 0.88;
   });
-
-  // Keep threshold “live” while listening (avoid stale closure)
   const matchThresholdRef = useRef(matchThreshold);
   useEffect(() => {
     matchThresholdRef.current = matchThreshold;
   }, [matchThreshold]);
+
+  // ===== AI Coach (shared with Roleplay via localStorage) =====
+  const [aiKey, setAiKey] = useState(() => localStorage.getItem("momentum_ai_openai_key") || "");
+  const [aiModel, setAiModel] = useState(() => localStorage.getItem("momentum_ai_openai_model") || "gpt-5-mini");
+  const [aiThinking, setAiThinking] = useState(false);
+
+  // We keep a tiny “turn log” for the AI.
+  const liveTurnsRef = useRef([]); // { role:'agent'|'client', text }
 
   // live audio refs
   const streamRef = useRef(null);
@@ -60,16 +67,14 @@ export default function LiveCoach({
 
   // voice feature extraction refs
   const bandRangesRef = useRef(null);
-  const segmentSumRef = useRef(null);
-  const segmentFramesRef = useRef(0);
 
   // enrollment accumulation refs
   const enrollSumRef = useRef(null);
   const enrollFramesRef = useRef(0);
 
-  // Used to let the speech-rec portion end enrollment early when 10/10 is done
-  const finalizeEnrollRef = useRef(null);
-  const enrollFinalizedRef = useRef(false);
+  // allow early finalize after 10/10
+  const enrollFinalizeRef = useRef(null);
+  const enrollFinalizingRef = useRef(false);
 
   // ===== Guided Enrollment Script + Word Highlight =====
   const ENROLL_LINES = useMemo(
@@ -95,23 +100,14 @@ export default function LiveCoach({
   const enrollSRRef = useRef(null);
   const enrollingRef = useRef(false);
 
+  // keep current line index in a ref so SR never reads stale state
   const enrollLineIndexRef = useRef(0);
   useEffect(() => {
     enrollLineIndexRef.current = enrollLineIndex;
   }, [enrollLineIndex]);
 
-  const enrollCompletedRef = useRef(enrollCompleted);
-  useEffect(() => {
-    enrollCompletedRef.current = enrollCompleted;
-    setEnrollCompletedCount(enrollCompleted.filter(Boolean).length);
-  }, [enrollCompleted]);
-
-  // Debounce advance
+  // debounce advance
   const lastAdvanceMsRef = useRef(0);
-
-  // Track partial/final SR chunks so we can match fast speech reliably without restarting SR
-  const srCommittedRef = useRef("");
-  const srInterimRef = useRef("");
 
   function normalizeWords(s) {
     return String(s || "")
@@ -127,8 +123,8 @@ export default function LiveCoach({
     const e = normalizeWords(expectedLine);
     const s = normalizeWords(spoken);
 
-    if (!e.length) return { ratio: 0, matchedWordIndexes: [], matchedCount: 0, expectedCount: 0 };
-    if (!s.length) return { ratio: 0, matchedWordIndexes: [], matchedCount: 0, expectedCount: e.length };
+    if (!e.length) return { ratio: 0, matchedWordIndexes: [] };
+    if (!s.length) return { ratio: 0, matchedWordIndexes: [] };
 
     let si = 0;
     const matched = [];
@@ -143,14 +139,14 @@ export default function LiveCoach({
     }
 
     const ratio = matched.length / e.length;
-    return { ratio, matchedWordIndexes: matched, matchedCount: matched.length, expectedCount: e.length };
+    return { ratio, matchedWordIndexes: matched };
   }
 
   function renderHighlightedLine(line, spoken) {
     const words = String(line || "").split(/\s+/);
     const { matchedWordIndexes } = computeMatch(line, spoken);
-
     const matchedSet = new Set(matchedWordIndexes);
+
     return (
       <div style={{ lineHeight: 1.35, fontSize: 14, fontWeight: 800 }}>
         {words.map((w, i) => (
@@ -169,6 +165,108 @@ export default function LiveCoach({
       </div>
     );
   }
+
+  function stopEnrollSpeechRec() {
+    try {
+      const sr = enrollSRRef.current;
+      if (!sr) return;
+      sr.onresult = null;
+      sr.onerror = null;
+      sr.onend = null;
+      sr.stop?.();
+    } catch {}
+    enrollSRRef.current = null;
+  }
+
+  function startEnrollSpeechRec() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return false;
+
+    stopEnrollSpeechRec();
+
+    try {
+      const sr = new SR();
+      sr.continuous = true;
+      sr.interimResults = true;
+      sr.lang = "en-US";
+
+      sr.onresult = (e) => {
+        // ✅ Better for “talking fast”: only use the most recent few results
+        let full = "";
+        const start = Math.max(0, e.results.length - 6);
+        for (let i = start; i < e.results.length; i++) {
+          full += e.results[i][0]?.transcript ? e.results[i][0].transcript + " " : "";
+        }
+        full = full.trim();
+        setEnrollTranscript(full);
+
+        const idx = enrollLineIndexRef.current;
+        const currentLine = ENROLL_LINES[idx] || "";
+        const { ratio } = computeMatch(currentLine, full);
+
+        // ✅ Was 0.82 — slightly lower makes it not “miss” when you talk fast
+        const DONE_AT = 0.74;
+
+        const now = Date.now();
+        if (ratio >= DONE_AT && now - lastAdvanceMsRef.current > 550) {
+          lastAdvanceMsRef.current = now;
+
+          setEnrollCompleted((prev) => {
+            const next = [...prev];
+            if (!next[idx]) next[idx] = true;
+            return next;
+          });
+
+          setEnrollLineIndex((prevIdx) => {
+            const nextIdx = prevIdx + 1 >= ENROLL_LINES.length ? prevIdx : prevIdx + 1;
+            enrollLineIndexRef.current = nextIdx;
+            return nextIdx;
+          });
+
+          setEnrollTranscript("");
+        }
+      };
+
+      sr.onerror = () => {};
+      sr.onend = () => {
+        if (enrollingRef.current) {
+          setTimeout(() => {
+            if (enrollingRef.current) {
+              try {
+                sr.start?.();
+              } catch {}
+            }
+          }, 120);
+        }
+      };
+
+      sr.start();
+      enrollSRRef.current = sr;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  useEffect(() => {
+    const count = enrollCompleted.filter(Boolean).length;
+    setEnrollCompletedCount(count);
+  }, [enrollCompleted]);
+
+  // ✅ Auto-finish enrollment early when 10/10 complete (as long as we captured enough voice frames)
+  useEffect(() => {
+    if (!enrolling) return;
+    if (enrollCompletedCount < 10) return;
+    if (enrollFinalizingRef.current) return;
+
+    // Wait until we have a solid voiceprint sample
+    if (enrollFramesRef.current < 15) return;
+
+    if (typeof enrollFinalizeRef.current === "function") {
+      enrollFinalizingRef.current = true;
+      enrollFinalizeRef.current();
+    }
+  }, [enrollCompletedCount, enrolling]);
 
   // ---------- voiceprint storage helpers ----------
   function loadVoiceprints() {
@@ -189,9 +287,11 @@ export default function LiveCoach({
     return m?.[deviceId]?.vec || null;
   }
 
-  // ✅ FIX: do NOT memoize this based only on deviceId (it must reflect localStorage changes after enrollment)
-  const enrolledVecForSelectedMic = getEnrolledVec(selectedDeviceId);
-  const isEnrolledForSelectedMic = Array.isArray(enrolledVecForSelectedMic) && enrolledVecForSelectedMic.length > 0;
+  const isEnrolledForSelectedMic = useMemo(() => {
+    const v = getEnrolledVec(selectedDeviceId);
+    return Array.isArray(v) && v.length > 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDeviceId]);
 
   // ---------- voice features ----------
   function setupBandRanges(ctx, analyser) {
@@ -295,9 +395,6 @@ export default function LiveCoach({
     inSpeechRef.current = false;
     heardSpeechSinceSuggestionRef.current = false;
 
-    segmentSumRef.current = null;
-    segmentFramesRef.current = 0;
-
     setMicLevel(0);
     setIsListening(false);
     setDetectedSpeaker("Unknown");
@@ -322,7 +419,7 @@ export default function LiveCoach({
 
     if (!isEnrolledForSelectedMic) {
       setStatus("Enrollment required");
-      setSayThisNext("Enroll your voice first (read the 10 lines, then it will unlock).");
+      setSayThisNext("Enroll your voice first (60 seconds) for this microphone.");
       return;
     }
 
@@ -362,9 +459,6 @@ export default function LiveCoach({
       heardSpeechSinceSuggestionRef.current = false;
       lastSpeechMsRef.current = Date.now();
 
-      segmentSumRef.current = new Array(20).fill(0);
-      segmentFramesRef.current = 0;
-
       calibratingRef.current = true;
       const calStart = Date.now();
       let calSamples = 0;
@@ -374,6 +468,9 @@ export default function LiveCoach({
       const freqDb = new Float32Array(analyser.frequencyBinCount);
 
       const enrolledVec = getEnrolledVec(selectedDeviceId);
+
+      // reset ai turn log
+      liveTurnsRef.current = [];
 
       const tick = () => {
         if (!runningRef.current || !analyserRef.current) return;
@@ -400,9 +497,8 @@ export default function LiveCoach({
             const avg = calSamples ? calSum / calSamples : 0.02;
             noiseFloorRef.current = Math.max(0.01, Math.min(0.06, avg));
 
-            // ✅ a bit more sensitive (helps quieter / faster speech)
-            talkThresholdRef.current = Math.max(0.028, noiseFloorRef.current * 2.2);
-            silenceThresholdRef.current = Math.max(0.018, noiseFloorRef.current * 1.5);
+            talkThresholdRef.current = Math.max(0.03, noiseFloorRef.current * 2.6);
+            silenceThresholdRef.current = Math.max(0.02, noiseFloorRef.current * 1.7);
 
             calibratingRef.current = false;
           }
@@ -414,6 +510,7 @@ export default function LiveCoach({
         const TALK = talkThresholdRef.current;
         const SIL = silenceThresholdRef.current;
 
+        // accumulate voice segment while speaking
         if (rms >= TALK) {
           inSpeechRef.current = true;
           heardSpeechSinceSuggestionRef.current = true;
@@ -422,23 +519,27 @@ export default function LiveCoach({
           analyserRef.current.getFloatFrequencyData(freqDb);
           const vec = extractBandVector(freqDb);
           if (vec) {
-            if (!segmentSumRef.current) segmentSumRef.current = new Array(vec.length).fill(0);
-            for (let i = 0; i < vec.length; i++) segmentSumRef.current[i] += vec[i];
-            segmentFramesRef.current += 1;
+            // store on refs (no need for separate arrays)
+            if (!LiveCoach._segSum) LiveCoach._segSum = new Array(vec.length).fill(0);
+            if (!LiveCoach._segFrames) LiveCoach._segFrames = 0;
+            for (let i = 0; i < vec.length; i++) LiveCoach._segSum[i] += vec[i];
+            LiveCoach._segFrames += 1;
           }
         } else if (rms <= SIL) {
           const silentFor = now - lastSpeechMsRef.current;
-
-          // ✅ slightly shorter pause so “fast talk” still triggers reliably
-          const SILENCE_MS = 650;
+          const SILENCE_MS = 850;
 
           if (inSpeechRef.current && heardSpeechSinceSuggestionRef.current && silentFor >= SILENCE_MS) {
             inSpeechRef.current = false;
             heardSpeechSinceSuggestionRef.current = false;
 
+            // build segment vector
             let segVec = null;
-            if (segmentSumRef.current && segmentFramesRef.current > 3) {
-              segVec = segmentSumRef.current.map((x) => x / segmentFramesRef.current);
+            const segSum = LiveCoach._segSum;
+            const segFrames = LiveCoach._segFrames || 0;
+
+            if (segSum && segFrames > 3) {
+              segVec = segSum.map((x) => x / segFrames);
 
               let n = 0;
               for (let i = 0; i < segVec.length; i++) n += segVec[i] * segVec[i];
@@ -446,8 +547,8 @@ export default function LiveCoach({
               segVec = segVec.map((x) => x / n);
             }
 
-            segmentSumRef.current = new Array(20).fill(0);
-            segmentFramesRef.current = 0;
+            LiveCoach._segSum = new Array(20).fill(0);
+            LiveCoach._segFrames = 0;
 
             let sim = 0;
             let speaker = "Unknown";
@@ -461,7 +562,35 @@ export default function LiveCoach({
             setDetectedSpeaker(speaker);
 
             if (speaker === "Client") {
-              setSayThisNext(pickLiveSuggestion());
+              // ✅ AI coach if key exists, otherwise fallback
+              if (!aiKey) {
+                setSayThisNext(pickLiveSuggestion());
+              } else if (!aiThinking) {
+                setAiThinking(true);
+
+                const turns = liveTurnsRef.current.slice(-10);
+                turns.push({
+                  role: "client",
+                  text: "(Client finished speaking. Generate the best next line for the agent to say.)",
+                });
+
+                aiBrainTurn({
+                  apiKey: aiKey,
+                  model: aiModel,
+                  difficulty: 2,
+                  mode: "live",
+                  turns,
+                })
+                  .then((out) => {
+                    const best = out?.coach?.best || out?.client || pickLiveSuggestion();
+                    setSayThisNext(best);
+                    liveTurnsRef.current = [...turns, { role: "agent", text: best }].slice(-20);
+                  })
+                  .catch(() => {
+                    setSayThisNext(pickLiveSuggestion());
+                  })
+                  .finally(() => setAiThinking(false));
+              }
             }
           }
         }
@@ -485,137 +614,9 @@ export default function LiveCoach({
     setSayThisNext("Stopped. Click START to listen again.");
   }
 
-  // ---------- Enrollment Speech Recognition ----------
-  function stopEnrollSpeechRec() {
-    try {
-      const sr = enrollSRRef.current;
-      if (!sr) return;
-      sr.onresult = null;
-      sr.onerror = null;
-      sr.onend = null;
-      sr.stop?.();
-    } catch {}
-    enrollSRRef.current = null;
-  }
-
-  function resetLineTranscript() {
-    srCommittedRef.current = "";
-    srInterimRef.current = "";
-    setEnrollTranscript("");
-  }
-
-  function startEnrollSpeechRec() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return false;
-
-    stopEnrollSpeechRec();
-
-    try {
-      const sr = new SR();
-      sr.continuous = true;
-      sr.interimResults = true;
-      sr.lang = "en-US";
-
-      resetLineTranscript();
-
-      sr.onresult = (e) => {
-        // Build committed + interim for “current line” without restarting SR (fixes fast speech misses)
-        let newCommitted = srCommittedRef.current;
-        let interim = "";
-
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const t = e.results[i][0]?.transcript ? e.results[i][0].transcript : "";
-          if (!t) continue;
-
-          if (e.results[i].isFinal) {
-            newCommitted = (newCommitted + " " + t).trim();
-          } else {
-            interim = (interim + " " + t).trim();
-          }
-        }
-
-        srCommittedRef.current = newCommitted;
-        srInterimRef.current = interim;
-
-        const full = (newCommitted + " " + interim).trim();
-        setEnrollTranscript(full);
-
-        const idx = enrollLineIndexRef.current;
-        const currentLine = ENROLL_LINES[idx] || "";
-
-        const { ratio, matchedCount, expectedCount } = computeMatch(currentLine, full);
-
-        // ✅ more forgiving + also require some minimum matched words
-        const DONE_AT = 0.74;
-        const minWords = Math.min(6, expectedCount || 0); // avoid 1-word accidental completes
-
-        const now = Date.now();
-        if (
-          expectedCount > 0 &&
-          ratio >= DONE_AT &&
-          matchedCount >= minWords &&
-          now - lastAdvanceMsRef.current > 450 &&
-          enrollingRef.current &&
-          !enrollFinalizedRef.current
-        ) {
-          lastAdvanceMsRef.current = now;
-
-          // mark current line complete
-          const prevArr = enrollCompletedRef.current;
-          const nextArr = [...prevArr];
-          if (!nextArr[idx]) nextArr[idx] = true;
-
-          // compute next count immediately
-          const nextCount = nextArr.filter(Boolean).length;
-          setEnrollCompleted(nextArr);
-          enrollCompletedRef.current = nextArr;
-
-          // If all 10 done, finalize early (unlock Live Coach immediately)
-          if (nextCount >= ENROLL_LINES.length) {
-            enrollFinalizedRef.current = true;
-            setSayThisNext("Completed ✅ Saving enrollment…");
-            finalizeEnrollRef.current?.();
-            return;
-          }
-
-          // advance line
-          const nextIdx = idx + 1 >= ENROLL_LINES.length ? 0 : idx + 1;
-          setEnrollLineIndex(nextIdx);
-          enrollLineIndexRef.current = nextIdx;
-
-          // reset transcript for next line (no SR restart needed)
-          resetLineTranscript();
-        }
-      };
-
-      sr.onerror = () => {};
-      sr.onend = () => {
-        // keep it running during enrollment
-        if (enrollingRef.current && !enrollFinalizedRef.current) {
-          setTimeout(() => {
-            if (enrollingRef.current && !enrollFinalizedRef.current) {
-              try {
-                sr.start?.();
-              } catch {}
-            }
-          }, 120);
-        }
-      };
-
-      sr.start();
-      enrollSRRef.current = sr;
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   // ---------- Enrollment ----------
   function stopEnrollmentHard() {
     enrollingRef.current = false;
-    enrollFinalizedRef.current = false;
-    finalizeEnrollRef.current = null;
-
     stopEnrollSpeechRec();
 
     if (enrollStopRef.current) {
@@ -625,6 +626,9 @@ export default function LiveCoach({
       enrollStopRef.current = null;
     }
 
+    enrollFinalizeRef.current = null;
+    enrollFinalizingRef.current = false;
+
     setEnrolling(false);
     setEnrollSecondsLeft(60);
     enrollSumRef.current = null;
@@ -632,10 +636,9 @@ export default function LiveCoach({
 
     setEnrollLineIndex(0);
     enrollLineIndexRef.current = 0;
-
-    resetLineTranscript();
-
+    setEnrollTranscript("");
     setEnrollCompleted(new Array(10).fill(false));
+    setEnrollCompletedCount(0);
     setStatus("Idle");
   }
 
@@ -651,9 +654,14 @@ export default function LiveCoach({
       return;
     }
 
+    if (!selectedDeviceId) {
+      setStatus("Pick a mic");
+      setSayThisNext("Pick your microphone from the dropdown first.");
+      return;
+    }
+
     setEnrolling(true);
     enrollingRef.current = true;
-    enrollFinalizedRef.current = false;
 
     setEnrollSecondsLeft(60);
     setDetectedSpeaker("Unknown");
@@ -663,9 +671,11 @@ export default function LiveCoach({
     enrollLineIndexRef.current = 0;
     lastAdvanceMsRef.current = 0;
 
-    resetLineTranscript();
-
+    setEnrollTranscript("");
     setEnrollCompleted(new Array(10).fill(false));
+    setEnrollCompletedCount(0);
+
+    enrollFinalizingRef.current = false;
 
     startEnrollSpeechRec();
 
@@ -704,26 +714,21 @@ export default function LiveCoach({
       const startMs = Date.now();
       const totalMs = 60_000;
 
-      const cleanupAudio = () => {
-        try {
-          if (raf) cancelAnimationFrame(raf);
-        } catch {}
+      const finalize = () => {
+        if (raf) cancelAnimationFrame(raf);
+
         try {
           stream?.getTracks()?.forEach((t) => t.stop());
         } catch {}
         try {
           ctx?.close?.();
         } catch {}
-      };
-
-      const finalize = () => {
-        cleanupAudio();
 
         enrollingRef.current = false;
         stopEnrollSpeechRec();
 
         let vec = null;
-        if (enrollSumRef.current && enrollFramesRef.current > 8) {
+        if (enrollSumRef.current && enrollFramesRef.current > 15) {
           vec = enrollSumRef.current.map((x) => x / enrollFramesRef.current);
 
           let n = 0;
@@ -736,12 +741,10 @@ export default function LiveCoach({
         setEnrollSecondsLeft(60);
         setMicLevel(0);
 
-        finalizeEnrollRef.current = null;
-
         if (!vec) {
+          enrollFinalizingRef.current = false;
           setStatus("Enrollment failed");
           setSayThisNext("Not enough clear speech captured. Try again and read the lines louder.");
-          enrollFinalizedRef.current = false;
           return;
         }
 
@@ -749,7 +752,7 @@ export default function LiveCoach({
         all[selectedDeviceId] = {
           vec,
           createdAt: new Date().toISOString(),
-          seconds: 60,
+          seconds: Math.min(60, Math.round((Date.now() - startMs) / 1000)),
         };
         saveVoiceprints(all);
 
@@ -757,8 +760,8 @@ export default function LiveCoach({
         setSayThisNext("Enrollment saved for this microphone. You can now START Live Coach.");
       };
 
-      // allow speech-rec to finalize early when 10/10 is done
-      finalizeEnrollRef.current = finalize;
+      // allow early finalize from the “10/10” effect
+      enrollFinalizeRef.current = finalize;
 
       const tick = () => {
         analyser.getByteTimeDomainData(timeData);
@@ -782,18 +785,17 @@ export default function LiveCoach({
             const avg = calSamples ? calSum / calSamples : 0.02;
             noiseFloorRef.current = Math.max(0.01, Math.min(0.06, avg));
 
-            // ✅ more sensitive capture
-            talkThresholdRef.current = Math.max(0.028, noiseFloorRef.current * 2.2);
-            silenceThresholdRef.current = Math.max(0.018, noiseFloorRef.current * 1.5);
+            talkThresholdRef.current = Math.max(0.03, noiseFloorRef.current * 2.6);
+            silenceThresholdRef.current = Math.max(0.02, noiseFloorRef.current * 1.7);
 
             calibratingRef.current = false;
           }
         } else {
           if (rms >= talkThresholdRef.current) {
             analyser.getFloatFrequencyData(freqDb);
-            const v = extractBandVector(freqDb);
-            if (v) {
-              for (let i = 0; i < v.length; i++) enrollSumRef.current[i] += v[i];
+            const vec = extractBandVector(freqDb);
+            if (vec) {
+              for (let i = 0; i < vec.length; i++) enrollSumRef.current[i] += vec[i];
               enrollFramesRef.current += 1;
             }
           }
@@ -803,15 +805,11 @@ export default function LiveCoach({
         const left = Math.max(0, Math.ceil((totalMs - elapsed) / 1000));
         setEnrollSecondsLeft(left);
 
-        // stop if timer ends (unless we already finalized early)
-        if (elapsed >= totalMs && !enrollFinalizedRef.current) {
-          enrollFinalizedRef.current = true;
-          finalize();
-          return;
-        }
+        // if early-finish happened, enrollingRef becomes false and we can stop
+        if (!enrollingRef.current) return;
 
-        // if speech already finalized early, stop ticking
-        if (enrollFinalizedRef.current) {
+        if (elapsed >= totalMs) {
+          finalize();
           return;
         }
 
@@ -819,10 +817,19 @@ export default function LiveCoach({
       };
 
       enrollStopRef.current = () => {
-        cleanupAudio();
+        if (raf) cancelAnimationFrame(raf);
+        try {
+          stream?.getTracks()?.forEach((t) => t.stop());
+        } catch {}
+        try {
+          ctx?.close?.();
+        } catch {}
+
         enrollingRef.current = false;
         stopEnrollSpeechRec();
-        finalizeEnrollRef.current = null;
+
+        enrollFinalizeRef.current = null;
+        enrollFinalizingRef.current = false;
 
         setEnrolling(false);
         setEnrollSecondsLeft(60);
@@ -857,6 +864,8 @@ export default function LiveCoach({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const enrollmentDone = enrollCompletedCount >= 10;
+
   return (
     <>
       <BackBar title="Live Coach" onBack={() => setView("home")} />
@@ -870,20 +879,57 @@ export default function LiveCoach({
           permissionState={permissionState}
         />
 
+        {/* AI Coach Panel */}
+        <div className="panel" style={{ marginTop: 12 }}>
+          <div className="panelTitle">AI Coach</div>
+          <div className="smallMuted" style={{ marginTop: 0 }}>
+            Uses the same OpenAI key as Roleplay (saved locally).
+          </div>
+
+          <input
+            className="field"
+            value={aiKey}
+            onChange={(e) => {
+              setAiKey(e.target.value);
+              localStorage.setItem("momentum_ai_openai_key", e.target.value);
+            }}
+            placeholder="sk-..."
+            style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}
+          />
+
+          <input
+            className="field"
+            value={aiModel}
+            onChange={(e) => {
+              setAiModel(e.target.value);
+              localStorage.setItem("momentum_ai_openai_model", e.target.value);
+            }}
+            placeholder="gpt-5-mini"
+            style={{ marginTop: 8 }}
+          />
+
+          <div className="smallMuted" style={{ marginTop: 8 }}>
+            Status:{" "}
+            <span style={{ color: aiThinking ? C.emerald : "rgba(237,239,242,0.75)", fontWeight: 900 }}>
+              {aiThinking ? "Thinking…" : aiKey ? "Ready" : "No API key (fallback mode)"}
+            </span>
+          </div>
+        </div>
+
         {!isEnrolledForSelectedMic ? (
           <div style={{ marginTop: 8 }}>
             <div className="panelTitle">Voice Enrollment Required</div>
 
             <div className="smallMuted" style={{ marginTop: 0 }}>
-              Read each line out loud. It highlights as you speak and auto-advances. When you hit 10/10, it saves
-              immediately and unlocks Live Coach.
+              Read each line out loud. It highlights as you speak and auto-advances. When you hit 10/10, it will
+              finish immediately (no need to wait the full 60s).
             </div>
 
             <div className="sayBox" style={{ marginTop: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <div style={{ fontWeight: 950 }}>
-                  {enrollCompletedCount >= 10 ? (
-                    <span style={{ color: C.emerald }}>Completed ✅</span>
+                  {enrollmentDone ? (
+                    <span style={{ color: C.emerald }}>Completed • 10/10</span>
                   ) : (
                     <>
                       Line {enrollLineIndex + 1}/10{" "}
@@ -891,7 +937,6 @@ export default function LiveCoach({
                     </>
                   )}
                 </div>
-
                 <div style={{ fontWeight: 900, color: "rgba(237,239,242,0.75)" }}>
                   {enrolling ? (
                     <>
@@ -913,8 +958,7 @@ export default function LiveCoach({
                   const pct = Math.round(ratio * 100);
                   return (
                     <>
-                      Match: <span style={{ color: C.emerald, fontWeight: 950 }}>{pct}%</span> • (If your browser doesn’t
-                      support speech recognition, highlighting won’t work.)
+                      Match: <span style={{ color: C.emerald, fontWeight: 950 }}>{pct}%</span> • (Talking fast is OK now.)
                     </>
                   );
                 })()}
@@ -932,7 +976,7 @@ export default function LiveCoach({
 
             <div className="row2" style={{ marginTop: 12 }}>
               <button className="btnOutline" disabled={enrolling || !selectedDeviceId} onClick={startEnrollment60s}>
-                START ENROLLMENT
+                START 60s ENROLLMENT
               </button>
               <button className="btnOutlineDim" disabled={!enrolling} onClick={stopEnrollmentHard}>
                 STOP
@@ -1007,3 +1051,7 @@ export default function LiveCoach({
     </>
   );
 }
+
+// used for segment accumulation without re-allocating tons of arrays
+LiveCoach._segSum = null;
+LiveCoach._segFrames = 0;
