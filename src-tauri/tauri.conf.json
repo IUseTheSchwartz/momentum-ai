@@ -31,6 +31,7 @@
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
+      "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
@@ -39,7 +40,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+        "https://github.com/IUseTheSchwartz/momentum-ai/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBMUE5RDEzQkUwNEQ2RDMKUldUVDFnUytFNTBhMnJ1d1VlWm1Kb1JLR0NWb0ZtbHZkcXhWYkgvU1ppSmExK1RKeVdmQkh5L2IK",
       "windows": {
