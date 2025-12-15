@@ -3,281 +3,147 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { C } from "../theme";
 import BackBar from "../components/BackBar";
 
-export default function Roleplay({ setView, setStatus, permissionState, ensureMicPermission }) {
-  // ============================================================
-  // GOALS:
-  // - super simple start
-  // - rebuttal buttons
-  // - no repeating same client line forever
-  // - progresses into a basic call flow (qualifying Q&A)
-  // ============================================================
+function isTauri() {
+  return typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
+}
 
-  const [voiceOn, setVoiceOn] = useState(true);
-  const [difficulty, setDifficulty] = useState(2); // 1 easy 2 normal 3 hard
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+export default function Roleplay({ setView, setStatus, permissionState, ensureMicPermission }) {
+  const [difficulty, setDifficulty] = useState(2);
+
+  // ✅ user-pasted key (local-only). We'll secure it later if you want.
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("momentum_ai_openai_key") || "");
+  const [model, setModel] = useState(() => localStorage.getItem("momentum_ai_openai_model") || "gpt-5-mini");
 
   const [running, setRunning] = useState(false);
-  const [callState, setCallState] = useState("idle"); // idle | active | ended
+  const [loading, setLoading] = useState(false);
 
-  const [clientLine, setClientLine] = useState("");
+  // chat log
+  const [chat, setChat] = useState([]); // { who: "client"|"agent", text }
   const [agentText, setAgentText] = useState("");
-  const [feedback, setFeedback] = useState(null);
 
-  const [agentInputMode, setAgentInputMode] = useState("type"); // type | voice
-  const [agentListening, setAgentListening] = useState(false);
+  // coach panel
+  const [coach, setCoach] = useState(null); // {score,note,best}
+  const [hangup, setHangup] = useState(false);
+
+  // Voice -> text (optional, same as before)
+  const [inputMode, setInputMode] = useState("type"); // type | voice
+  const [listening, setListening] = useState(false);
   const srRef = useRef(null);
 
-  // conversation engine
-  const [phase, setPhase] = useState("idle"); // idle | objection | qualify | close
-  const [scenarioId, setScenarioId] = useState("not_interested");
-  const scenarioRef = useRef("not_interested");
-
-  const [turn, setTurn] = useState(0);
-
-  // client profile (used in qualify phase)
-  const [profile, setProfile] = useState(null);
-
-  // female voice selection
-  const preferredVoiceRef = useRef(null);
-  function chooseFemaleVoice() {
-    try {
-      const voices = window.speechSynthesis?.getVoices?.() || [];
-      if (!voices.length) return null;
-
-      const isEnglish = (v) => /en(-|_)?/i.test(v.lang || "");
-      const name = (v) => String(v.name || "").toLowerCase();
-
-      const femaleHints = [
-        "female",
-        "samantha",
-        "victoria",
-        "karen",
-        "tessa",
-        "moira",
-        "serena",
-        "zira",
-        "ava",
-        "allison",
-        "emma",
-        "olivia",
-        "natalie",
-        "joanna",
-      ];
-
-      let pick =
-        voices.find((v) => isEnglish(v) && femaleHints.some((h) => name(v).includes(h))) ||
-        voices.find((v) => femaleHints.some((h) => name(v).includes(h))) ||
-        null;
-
-      if (!pick) pick = voices.find((v) => isEnglish(v)) || voices[0] || null;
-      preferredVoiceRef.current = pick;
-      return pick;
-    } catch {
-      return null;
-    }
-  }
-
-  useEffect(() => {
-    chooseFemaleVoice();
-    const handler = () => chooseFemaleVoice();
-    window.speechSynthesis?.addEventListener?.("voiceschanged", handler);
-    return () => window.speechSynthesis?.removeEventListener?.("voiceschanged", handler);
-  }, []);
-
-  function speak(text) {
-    if (!voiceOn) return;
-    try {
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.03;
-      u.pitch = 0.95;
-      u.volume = 1;
-
-      const v = preferredVoiceRef.current || chooseFemaleVoice();
-      if (v) u.voice = v;
-
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(u);
-    } catch {}
-  }
-
-  // -------- Scenarios (simple + controlled) --------
-  const SCENARIOS = useMemo(
-    () => ({
-      not_interested: {
-        label: "Not interested",
-        clientStart: "I’m not interested.",
-        best: [
-          "No worries — real quick, do you currently have a policy or two in place?",
-          "Totally get it. Before I let you go, do you have anything in place today?",
-          "That’s fair. If you already have coverage I’ll leave you alone — do you have something in place right now?",
-        ],
-        okPushback: "I just don’t want to deal with this right now.",
-        badPushback: "Yeah… I’m not interested. Like I said.",
-      },
-      busy: {
-        label: "Busy",
-        clientStart: "I’m busy right now.",
-        best: [
-          "Totally get it — this’ll take 60 seconds. Are you at least still interested in getting something in place?",
-          "No worries. Give me 60 seconds to see if you even qualify — fair?",
-          "I hear you. Quick yes/no: do you still want coverage, or should I close it out?",
-        ],
-        okPushback: "I said I’m busy. What is this about?",
-        badPushback: "I can’t talk. I’m hanging up.",
-      },
-      cant_afford: {
-        label: "Can’t afford",
-        clientStart: "I can’t afford it.",
-        best: [
-          "I hear you — that’s why we look at options. What monthly number would feel comfortable if you’re approved?",
-          "Makes sense. If we can get you approved, what’s a comfortable monthly budget?",
-          "Totally get it. If it’s too high we stop — what monthly number feels doable?",
-        ],
-        okPushback: "I don’t know… money is tight.",
-        badPushback: "If it costs anything, I’m not doing it.",
-      },
-      spouse: {
-        label: "Talk to spouse",
-        clientStart: "I need to talk to my wife/husband.",
-        best: [
-          "Of course — are they available for 2 minutes so we can handle it together?",
-          "Totally. Are they there with you right now?",
-          "No problem — what time today are you both free for 2 minutes so we can knock it out together?",
-        ],
-        okPushback: "They’re not here and they won’t like this.",
-        badPushback: "I’m not doing anything without them. Bye.",
-      },
-      already_have: {
-        label: "Already have",
-        clientStart: "I already have something in place.",
-        best: [
-          "Perfect — is it through work or something you got personally?",
-          "Nice. Do you know what it would actually pay out today?",
-          "Great. If you don’t mind—work policy or personal policy?",
-        ],
-        okPushback: "It’s through work, I think. I’m covered.",
-        badPushback: "I’m good. Don’t need anything.",
-      },
-      random: {
-        label: "Random",
-        clientStart: "",
-        best: [],
-        okPushback: "",
-        badPushback: "",
-      },
-    }),
+  const QUICK = useMemo(
+    () => [
+      "Totally get it — this’ll take 60 seconds. Are you at least still interested in getting something in place?",
+      "Is that through work, or something you got personally?",
+      "Fair enough — what monthly number would feel comfortable if we can get you approved?",
+      "Before we go further, do you currently have any life insurance in place today?",
+    ],
     []
   );
 
-  function pickScenario(id) {
-    if (id === "random") {
-      const keys = Object.keys(SCENARIOS).filter((k) => k !== "random");
-      return keys[Math.floor(Math.random() * keys.length)];
+  useEffect(() => {
+    localStorage.setItem("momentum_ai_openai_key", apiKey);
+  }, [apiKey]);
+
+  useEffect(() => {
+    localStorage.setItem("momentum_ai_openai_model", model);
+  }, [model]);
+
+  function buildTranscript(nextChat) {
+    // keep it simple & readable for the model
+    return nextChat
+      .map((m) => (m.who === "agent" ? `Agent: ${m.text}` : `Client: ${m.text}`))
+      .join("\n");
+  }
+
+  async function aiTurn(nextChat) {
+    if (!isTauri()) {
+      alert("AI Roleplay requires the Tauri app (not a normal browser tab).");
+      return null;
     }
-    return id;
-  }
 
-  function clean(s) {
-    return String(s || "")
-      .toLowerCase()
-      .replace(/[’‘]/g, "'")
-      .replace(/'/g, "")
-      .replace(/[^a-z0-9\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
+    const { invoke } = await import("@tauri-apps/api/core");
 
-  function scoreResponse(userText, bestText) {
-    const uWords = new Set(clean(userText).split(" ").filter(Boolean));
-    const bWords = new Set(clean(bestText).split(" ").filter(Boolean));
+    const transcript = buildTranscript(nextChat);
 
-    let overlap = 0;
-    bWords.forEach((w) => {
-      if (uWords.has(w)) overlap += 1;
+    const res = await invoke("ai_roleplay_turn", {
+      input: {
+        api_key: apiKey,
+        model,
+        difficulty,
+        transcript,
+      },
     });
 
-    const raw = bWords.size ? overlap / bWords.size : 0;
-    let base = Math.round(raw * 100);
+    // res = { raw_text }
+    const rawText = res?.raw_text || "";
+    const parsed = safeJsonParse(rawText);
 
-    const hasQuestion = userText.includes("?");
-    const hasEmpathy = /(totally|get it|understand|no worries|makes sense|i hear you|fair)/i.test(userText);
+    if (!parsed || !parsed.client) {
+      return { fallbackRaw: rawText };
+    }
 
-    if (hasQuestion) base += 8;
-    if (hasEmpathy) base += 8;
-
-    return Math.max(0, Math.min(100, base));
+    return parsed;
   }
 
-  function getOutcome(score) {
-    if (score >= 72) return "good";
-    if (score >= 48) return "ok";
-    return "bad";
+  async function start() {
+    if (!apiKey.trim()) {
+      alert("Paste your OpenAI API key first (Roleplay Setup).");
+      return;
+    }
+
+    setStatus("Roleplay");
+    setRunning(true);
+    setHangup(false);
+    setCoach(null);
+    setAgentText("");
+    setChat([]);
+
+    // First client line (AI generates opener objection)
+    setLoading(true);
+    try {
+      const seed = [{ who: "agent", text: "Hi — this is Momentum Financial getting back to you about your request." }];
+      const out = await aiTurn(seed);
+
+      if (out?.fallbackRaw) {
+        setChat(seed);
+        setCoach(null);
+        setHangup(false);
+        setChat((prev) => [...prev, { who: "client", text: out.fallbackRaw }]);
+        return;
+      }
+
+      setChat([...seed, { who: "client", text: out.client }]);
+      setCoach(out.coach || null);
+      setHangup(!!out.hangup);
+    } catch (e) {
+      console.error(e);
+      alert("AI failed to start roleplay. Check your key/model.");
+      setRunning(false);
+    } finally {
+      setLoading(false);
+    }
   }
 
-  // --------- Qualify Q&A (fake client profile) ---------
-  function randomFrom(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
+  function stop() {
+    setRunning(false);
+    setHangup(false);
+    setLoading(false);
+    setCoach(null);
+    setAgentText("");
+    setChat([]);
+    stopSpeech();
+    setStatus("Idle");
   }
 
-  function makeClientProfile() {
-    const first = randomFrom(["Maria", "James", "Tanya", "Robert", "Angela", "Chris", "Stephanie", "Mike"]);
-    const state = randomFrom(["TX", "FL", "GA", "TN", "NC", "OH", "IL", "MO", "AZ"]);
-    const smoker = Math.random() < 0.35;
-    const beneficiary = randomFrom(["my son", "my daughter", "my wife", "my husband", "my mom", "my sister"]);
-    const coverage = randomFrom(["10,000", "15,000", "20,000", "25,000"]);
-    const budget = randomFrom(["40", "55", "65", "80"]);
-    const workPolicy = Math.random() < 0.55;
-
-    // dob approx
-    const year = 1965 + Math.floor(Math.random() * 30); // 1965-1994
-    const month = 1 + Math.floor(Math.random() * 12);
-    const day = 1 + Math.floor(Math.random() * 28);
-
-    return {
-      first,
-      state,
-      smoker,
-      beneficiary,
-      coverage,
-      budget,
-      workPolicy,
-      dob: `${month}/${day}/${year}`,
-    };
-  }
-
-  function clientAnswerToQuestion(q, p) {
-    const s = clean(q);
-
-    if (/(policy|life insurance|in place|coverage today)/.test(s)) {
-      return p.workPolicy ? "Yeah, I have something through work." : "No, I don’t have anything right now.";
-    }
-    if (/(through work|work policy|personal)/.test(s)) {
-      return p.workPolicy ? "It’s through work." : "I don’t have one, so nothing through work.";
-    }
-    if (/(how much|coverage|final expenses|face amount|10k|25k)/.test(s)) {
-      return `Probably like $${p.coverage}.`;
-    }
-    if (/(beneficiary|who.*benefit|who.*go to)/.test(s)) {
-      return `I’d put ${p.beneficiary}.`;
-    }
-    if (/(tobacco|nicotine|smoke|vape)/.test(s)) {
-      return p.smoker ? "Yeah, I smoke." : "No, I don’t use tobacco.";
-    }
-    if (/(state|where.*located|what state)/.test(s)) {
-      return `${p.state}.`;
-    }
-    if (/(date of birth|dob|born|birthday)/.test(s)) {
-      return `${p.dob}.`;
-    }
-    if (/(monthly|budget|comfortable|afford)/.test(s)) {
-      return `Probably around $${p.budget} a month.`;
-    }
-
-    // default
-    return "Okay…";
-  }
-
-  // -------- Voice STT for agent (optional) --------
-  function stopSpeechRec() {
+  function stopSpeech() {
     try {
       const sr = srRef.current;
       if (!sr) return;
@@ -287,15 +153,20 @@ export default function Roleplay({ setView, setStatus, permissionState, ensureMi
       sr.stop?.();
     } catch {}
     srRef.current = null;
-    setAgentListening(false);
+    setListening(false);
   }
 
-  async function startSpeechRec() {
+  async function startSpeech() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return false;
+    if (!SR) {
+      alert("SpeechRecognition not supported on this system.");
+      return;
+    }
 
     const ok = permissionState === "granted" ? true : await ensureMicPermission();
-    if (!ok) return false;
+    if (!ok) return;
+
+    stopSpeech();
 
     try {
       const sr = new SR();
@@ -312,178 +183,66 @@ export default function Roleplay({ setView, setStatus, permissionState, ensureMi
       };
 
       sr.onerror = () => {};
-      sr.onend = () => setAgentListening(false);
+      sr.onend = () => setListening(false);
 
       sr.start();
       srRef.current = sr;
-      setAgentListening(true);
-      return true;
+      setListening(true);
     } catch {
-      return false;
+      setListening(false);
     }
   }
 
-  // -------- Start / End / Submit --------
-  function startRoleplay() {
-    const chosen = pickScenario(scenarioId);
-    scenarioRef.current = chosen;
+  async function send() {
+    if (!running || loading || hangup) return;
 
-    const p = makeClientProfile();
-    setProfile(p);
+    const text = agentText.trim();
+    if (!text) return;
 
-    setRunning(true);
-    setCallState("active");
-    setPhase("objection");
-    setTurn(0);
-    setFeedback(null);
+    const nextChat = [...chat, { who: "agent", text }];
+    setChat(nextChat);
     setAgentText("");
 
-    const firstLine = SCENARIOS[chosen].clientStart;
-    setClientLine(firstLine);
-    speak(firstLine);
-    setStatus("Roleplay");
-  }
+    setLoading(true);
+    try {
+      const out = await aiTurn(nextChat);
 
-  function endRoleplay() {
-    setRunning(false);
-    setCallState("ended");
-    setPhase("idle");
-    setClientLine("");
-    setAgentText("");
-    setFeedback(null);
-    setTurn(0);
-    stopSpeechRec();
-    setStatus("Idle");
-  }
+      if (out?.fallbackRaw) {
+        setChat((prev) => [...prev, { who: "client", text: out.fallbackRaw }]);
+        setCoach(null);
+        setHangup(false);
+        return;
+      }
 
-  function submitTurn() {
-    if (!running || callState !== "active") return;
-    const user = agentText.trim();
-    if (!user) return;
-
-    const sid = scenarioRef.current;
-    const scenario = SCENARIOS[sid];
-    const p = profile || makeClientProfile();
-
-    // If we’re in qualify mode, client answers the agent’s question
-    if (phase === "qualify") {
-      const answer = clientAnswerToQuestion(user, p);
-
-      setClientLine(answer);
-      speak(answer);
-
-      setFeedback({
-        score: null,
-        note: "Good — keep moving forward with the questions.",
-        best: "",
-      });
-
-      setTurn((t) => t + 1);
-      setAgentText("");
-      stopSpeechRec();
-      return;
+      setChat((prev) => [...prev, { who: "client", text: out.client }]);
+      setCoach(out.coach || null);
+      setHangup(!!out.hangup);
+    } catch (e) {
+      console.error(e);
+      alert("AI failed to respond. Try again.");
+    } finally {
+      setLoading(false);
+      stopSpeech();
     }
-
-    // Objection phase scoring
-    const best = scenario.best?.[0] || "";
-    const score = scoreResponse(user, best);
-    const outcome = getOutcome(score);
-
-    // Difficulty affects hangup chance on bad responses
-    const hangupChance = difficulty === 1 ? 0.03 : difficulty === 2 ? 0.10 : 0.20;
-
-    if (outcome === "bad" && Math.random() < hangupChance) {
-      const hang = "Alright. I’m gonna go — I’m not doing all that right now.";
-      setClientLine(hang);
-      speak(hang);
-      setFeedback({ score, note: "They hung up. Keep it shorter and ask a direct question.", best });
-      setCallState("ended");
-      setRunning(false);
-      stopSpeechRec();
-      return;
-    }
-
-    if (outcome === "good") {
-      // progress into qualify
-      const okLine = "Okay… just make it quick.";
-      setClientLine(okLine);
-      speak(okLine);
-      setPhase("qualify");
-
-      setFeedback({
-        score,
-        note: "✅ Nice. Now go straight into your qualifying questions.",
-        best,
-      });
-    } else if (outcome === "ok") {
-      // pushback but different line (no infinite repeat)
-      const push = scenario.okPushback || "Okay… but what is this about?";
-      setClientLine(push);
-      speak(push);
-
-      setFeedback({
-        score,
-        note: "Decent — tighten it up and end with a direct question.",
-        best,
-      });
-    } else {
-      // bad: client repeats/stronger pushback (still progresses a bit, not the same exact line)
-      const push = scenario.badPushback || "I said no — I’m not interested.";
-      setClientLine(push);
-      speak(push);
-
-      setFeedback({
-        score,
-        note: "Too long / not direct. Use a short rebuttal + question.",
-        best,
-      });
-    }
-
-    setTurn((t) => t + 1);
-    setAgentText("");
-    stopSpeechRec();
   }
-
-  // -------- Rebuttal buttons (simple) --------
-  const rebuttalOptions = useMemo(() => {
-    const sid = scenarioRef.current;
-    const scenario = SCENARIOS[sid] || SCENARIOS.not_interested;
-
-    const list = scenario.best?.length ? scenario.best : SCENARIOS.not_interested.best;
-
-    return [
-      { label: "Best (short)", text: list[0] || "" },
-      { label: "Empathy + question", text: list[1] || list[0] || "" },
-      { label: "Alt", text: list[2] || list[0] || "" },
-    ];
-  }, [SCENARIOS]);
-
-  // cleanup
-  useEffect(() => {
-    return () => {
-      stopSpeechRec();
-      try {
-        window.speechSynthesis?.cancel?.();
-      } catch {}
-      setStatus("Idle");
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   return (
     <>
-      <BackBar title="Roleplay" onBack={() => setView("home")} />
+      <BackBar title="Roleplay Trainer" onBack={() => setView("home")} />
 
-      {/* SIMPLE SETUP */}
       <div className="panel">
-        <div className="panelTitle">Roleplay Setup</div>
+        <div className="panelTitle">Setup</div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <div className="smallMuted" style={{ marginTop: 0 }}>
+          This is now AI-driven: client replies change based on what you say (no more looping the same line).
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
           <div>
             <div className="smallMuted" style={{ marginTop: 0 }}>
               Difficulty
             </div>
-            <select className="field" value={difficulty} onChange={(e) => setDifficulty(Number(e.target.value))}>
+            <select className="field" value={difficulty} onChange={(e) => setDifficulty(Number(e.target.value))} disabled={running}>
               <option value={1}>Easy</option>
               <option value={2}>Normal</option>
               <option value={3}>Hard</option>
@@ -492,122 +251,97 @@ export default function Roleplay({ setView, setStatus, permissionState, ensureMi
 
           <div>
             <div className="smallMuted" style={{ marginTop: 0 }}>
-              Client voice
+              Input
             </div>
-            <select className="field" value={voiceOn ? "on" : "off"} onChange={(e) => setVoiceOn(e.target.value === "on")}>
-              <option value="on">Voice ON</option>
-              <option value="off">Voice OFF</option>
+            <select
+              className="field"
+              value={inputMode}
+              onChange={(e) => {
+                const v = e.target.value;
+                setInputMode(v);
+                if (v === "type") stopSpeech();
+              }}
+              disabled={running && loading}
+            >
+              <option value="type">Type</option>
+              <option value="voice">Voice → Text</option>
             </select>
           </div>
         </div>
 
         <div style={{ marginTop: 10 }}>
           <div className="smallMuted" style={{ marginTop: 0 }}>
-            Your input
+            OpenAI API key (local only)
           </div>
-          <select
+          <input
             className="field"
-            value={agentInputMode}
-            onChange={(e) => {
-              const v = e.target.value;
-              setAgentInputMode(v);
-              if (v === "type") stopSpeechRec();
-            }}
-          >
-            <option value="type">Type</option>
-            <option value="voice">Voice (speech-to-text)</option>
-          </select>
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="sk-..."
+            disabled={running}
+            style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}
+          />
         </div>
 
         <div style={{ marginTop: 10 }}>
           <div className="smallMuted" style={{ marginTop: 0 }}>
-            Start scenario
+            Model
           </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
-            {Object.entries(SCENARIOS).map(([id, s]) => (
-              <button
-                key={id}
-                className={scenarioId === id ? "chipOn" : "chipOff"}
-                onClick={() => setScenarioId(id)}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
+          <input className="field" value={model} onChange={(e) => setModel(e.target.value)} disabled={running} />
         </div>
 
         <div style={{ marginTop: 12 }}>
           {!running ? (
-            <button className="btnOutline" onClick={startRoleplay} style={{ width: "100%" }}>
-              START ROLEPLAY
+            <button className="btnOutline" onClick={start} disabled={loading}>
+              {loading ? "Starting…" : "START ROLEPLAY"}
             </button>
           ) : (
-            <button className="btnOutlineDim" onClick={endRoleplay} style={{ width: "100%" }}>
+            <button className="btnOutlineDim" onClick={stop}>
               END ROLEPLAY
             </button>
           )}
         </div>
       </div>
 
-      {/* CALL */}
       {running && (
         <div className="panel" style={{ marginTop: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-            <div className="panelTitle">Call</div>
-            <div
-              style={{
-                fontSize: 12,
-                fontWeight: 950,
-                padding: "6px 10px",
-                borderRadius: 999,
-                border: `1px solid ${C.border}`,
-                background: "rgba(16,185,129,0.14)",
-                color: C.emerald,
-              }}
-            >
-              {phase === "objection" ? "Objection" : phase === "qualify" ? "Qualifying" : "Active"}
-            </div>
+          <div className="panelTitle">Call</div>
+
+          <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+            {chat.map((m, i) => (
+              <div
+                key={i}
+                className="sayBox"
+                style={{
+                  border: `1px solid ${C.border}`,
+                  background: m.who === "client" ? "rgba(255,255,255,0.06)" : "rgba(16,185,129,0.10)",
+                }}
+              >
+                <div style={{ fontSize: 11, fontWeight: 950, color: m.who === "client" ? "rgba(237,239,242,0.70)" : C.emerald }}>
+                  {m.who === "client" ? "CLIENT" : "YOU"}
+                </div>
+                <div style={{ marginTop: 6 }}>{m.text}</div>
+              </div>
+            ))}
           </div>
 
-          <div style={{ marginTop: 10 }}>
-            <div className="smallMuted" style={{ marginTop: 0 }}>
-              Client says
-            </div>
-            <div className="sayBox">{clientLine || "…"}</div>
-          </div>
-
-          {/* Rebuttal buttons only during objection phase */}
-          {phase === "objection" && (
-            <div style={{ marginTop: 10 }}>
-              <div className="smallMuted" style={{ marginTop: 0 }}>
-                Quick rebuttals (tap one)
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
-                {rebuttalOptions.map((o) => (
-                  <button
-                    key={o.label}
-                    className="chipOn"
-                    onClick={() => setAgentText(o.text)}
-                    style={{ borderColor: "rgba(16,185,129,0.35)", background: "rgba(16,185,129,0.10)" }}
-                  >
-                    {o.label}
-                  </button>
-                ))}
-              </div>
+          {hangup && (
+            <div className="sayBox" style={{ marginTop: 10 }}>
+              Client hung up. Click END ROLEPLAY, then START again.
             </div>
           )}
 
           <div style={{ marginTop: 12 }}>
             <div className="smallMuted" style={{ marginTop: 0 }}>
-              Your response ({agentInputMode === "voice" ? "voice → text" : "type"})
+              Your response
             </div>
 
-            {agentInputMode === "voice" && (
+            {inputMode === "voice" && (
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button className="btn" disabled={agentListening} onClick={startSpeechRec} style={{ whiteSpace: "nowrap" }}>
-                  {agentListening ? "Listening…" : "Start talking"}
+                <button className="btn" onClick={startSpeech} disabled={listening || loading || hangup} style={{ whiteSpace: "nowrap" }}>
+                  {listening ? "Listening…" : "Start talking"}
                 </button>
-                <button className="btnOutlineDim" disabled={!agentListening} onClick={stopSpeechRec} style={{ whiteSpace: "nowrap" }}>
+                <button className="btnOutlineDim" onClick={stopSpeech} disabled={!listening} style={{ whiteSpace: "nowrap" }}>
                   Stop
                 </button>
               </div>
@@ -618,64 +352,36 @@ export default function Roleplay({ setView, setStatus, permissionState, ensureMi
               style={{ minHeight: 110, resize: "none", marginTop: 10 }}
               value={agentText}
               onChange={(e) => setAgentText(e.target.value)}
-              placeholder={agentInputMode === "voice" ? "Your speech will appear here…" : "Type what you would say…"}
+              placeholder={inputMode === "voice" ? "Your speech will appear here…" : "Type what you would say…"}
+              disabled={loading || hangup}
             />
-          </div>
 
-          <div className="row2" style={{ marginTop: 10 }}>
-            <button className="btnOutline" onClick={submitTurn} disabled={!agentText.trim()}>
-              SUBMIT (Client responds)
-            </button>
-
-            <button
-              className="btnOutlineDim"
-              onClick={() => {
-                // quick “move forward” button
-                if (phase === "objection") {
-                  setClientLine("Okay… just make it quick.");
-                  speak("Okay… just make it quick.");
-                  setPhase("qualify");
-                  setFeedback({ score: null, note: "Forced to qualifying. Now ask your questions.", best: "" });
-                } else {
-                  setClientLine("Okay…");
-                  speak("Okay…");
-                }
-              }}
-            >
-              FORCE FORWARD
-            </button>
-          </div>
-
-          {feedback && (
-            <div style={{ marginTop: 12 }}>
-              <div className="panelTitle">Coach</div>
-              <div className="sayBox">
-                {feedback.best ? (
-                  <>
-                    <div style={{ fontWeight: 900, marginBottom: 6 }}>Best response:</div>
-                    <div style={{ marginBottom: 10 }}>{feedback.best}</div>
-                  </>
-                ) : null}
-                <div>{feedback.note}</div>
-              </div>
-
-              {typeof feedback.score === "number" && (
-                <div className="smallMuted" style={{ marginTop: 8 }}>
-                  Score: <span style={{ color: C.emerald, fontWeight: 950 }}>{feedback.score}/100</span> • Turn {turn}
-                </div>
-              )}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+              {QUICK.map((q) => (
+                <button key={q} className="chipOn" onClick={() => setAgentText((t) => (t ? t + " " + q : q))} disabled={loading || hangup}>
+                  Quick rebuttal
+                </button>
+              ))}
             </div>
-          )}
-        </div>
-      )}
 
-      {/* Tiny helper when call is not running */}
-      {!running && (
-        <div className="panel" style={{ marginTop: 12 }}>
-          <div className="panelTitle">How it works</div>
-          <div className="smallMuted" style={{ marginTop: 0 }}>
-            Start a scenario → rebut the objection → once the client says “make it quick”, you move into qualifying. In
-            qualifying mode, the client answers your questions based on a generated profile.
+            <div className="row2" style={{ marginTop: 10 }}>
+              <button className="btnOutline" onClick={send} disabled={!agentText.trim() || loading || hangup}>
+                {loading ? "Thinking…" : "SEND"}
+              </button>
+              <button className="btnOutlineDim" onClick={() => setAgentText("")} disabled={loading}>
+                Clear
+              </button>
+            </div>
+
+            {coach && (
+              <div style={{ marginTop: 12 }}>
+                <div className="panelTitle">Coach</div>
+                <div className="sayBox">{coach.best || "—"}</div>
+                <div className="smallMuted" style={{ marginTop: 6 }}>
+                  Score: <span style={{ color: C.emerald, fontWeight: 950 }}>{coach.score ?? "—"}</span> • {coach.note || ""}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
