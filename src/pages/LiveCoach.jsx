@@ -28,6 +28,12 @@ export default function LiveCoach({
     return Number.isFinite(v) ? v : 0.88;
   });
 
+  // Keep threshold “live” while listening (avoid stale closure)
+  const matchThresholdRef = useRef(matchThreshold);
+  useEffect(() => {
+    matchThresholdRef.current = matchThreshold;
+  }, [matchThreshold]);
+
   // live audio refs
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -61,6 +67,10 @@ export default function LiveCoach({
   const enrollSumRef = useRef(null);
   const enrollFramesRef = useRef(0);
 
+  // Used to let the speech-rec portion end enrollment early when 10/10 is done
+  const finalizeEnrollRef = useRef(null);
+  const enrollFinalizedRef = useRef(false);
+
   // ===== Guided Enrollment Script + Word Highlight =====
   const ENROLL_LINES = useMemo(
     () => [
@@ -85,23 +95,29 @@ export default function LiveCoach({
   const enrollSRRef = useRef(null);
   const enrollingRef = useRef(false);
 
-  // ✅ FIX: keep current line index in a ref so SpeechRecognition never reads stale state
   const enrollLineIndexRef = useRef(0);
   useEffect(() => {
     enrollLineIndexRef.current = enrollLineIndex;
   }, [enrollLineIndex]);
 
-  // ✅ FIX: prevent double-advance spam
+  const enrollCompletedRef = useRef(enrollCompleted);
+  useEffect(() => {
+    enrollCompletedRef.current = enrollCompleted;
+    setEnrollCompletedCount(enrollCompleted.filter(Boolean).length);
+  }, [enrollCompleted]);
+
+  // Debounce advance
   const lastAdvanceMsRef = useRef(0);
 
-  // ✅ FIX: normalize both ’ and ' the same (remove apostrophes entirely)
+  // Track partial/final SR chunks so we can match fast speech reliably without restarting SR
+  const srCommittedRef = useRef("");
+  const srInterimRef = useRef("");
+
   function normalizeWords(s) {
     return String(s || "")
       .toLowerCase()
-      // normalize curly apostrophes/quotes to straight, then remove apostrophes
       .replace(/[’‘]/g, "'")
       .replace(/'/g, "")
-      // strip everything except letters/numbers/spaces
       .replace(/[^a-z0-9\s]/g, "")
       .split(/\s+/)
       .filter(Boolean);
@@ -111,8 +127,8 @@ export default function LiveCoach({
     const e = normalizeWords(expectedLine);
     const s = normalizeWords(spoken);
 
-    if (!e.length) return { ratio: 0, matchedWordIndexes: [] };
-    if (!s.length) return { ratio: 0, matchedWordIndexes: [] };
+    if (!e.length) return { ratio: 0, matchedWordIndexes: [], matchedCount: 0, expectedCount: 0 };
+    if (!s.length) return { ratio: 0, matchedWordIndexes: [], matchedCount: 0, expectedCount: e.length };
 
     let si = 0;
     const matched = [];
@@ -127,7 +143,7 @@ export default function LiveCoach({
     }
 
     const ratio = matched.length / e.length;
-    return { ratio, matchedWordIndexes: matched };
+    return { ratio, matchedWordIndexes: matched, matchedCount: matched.length, expectedCount: e.length };
   }
 
   function renderHighlightedLine(line, spoken) {
@@ -154,101 +170,6 @@ export default function LiveCoach({
     );
   }
 
-  function stopEnrollSpeechRec() {
-    try {
-      const sr = enrollSRRef.current;
-      if (!sr) return;
-      sr.onresult = null;
-      sr.onerror = null;
-      sr.onend = null;
-      sr.stop?.();
-    } catch {}
-    enrollSRRef.current = null;
-  }
-
-  function startEnrollSpeechRec() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return false;
-
-    // always start clean
-    stopEnrollSpeechRec();
-
-    try {
-      const sr = new SR();
-      sr.continuous = true;
-      sr.interimResults = true;
-      sr.lang = "en-US";
-
-      sr.onresult = (e) => {
-        // Build transcript text (ok to be "full", match is subsequence-based)
-        let full = "";
-        for (let i = 0; i < e.results.length; i++) {
-          full += e.results[i][0]?.transcript ? e.results[i][0].transcript + " " : "";
-        }
-        full = full.trim();
-        setEnrollTranscript(full);
-
-        const idx = enrollLineIndexRef.current;
-        const currentLine = ENROLL_LINES[idx] || "";
-        const { ratio } = computeMatch(currentLine, full);
-
-        const DONE_AT = 0.82;
-
-        // ✅ debounce advance
-        const now = Date.now();
-        if (ratio >= DONE_AT && now - lastAdvanceMsRef.current > 700) {
-          lastAdvanceMsRef.current = now;
-
-          setEnrollCompleted((prev) => {
-            const next = [...prev];
-            if (!next[idx]) next[idx] = true;
-            return next;
-          });
-
-          // advance line + update ref in the setter (no stale)
-          setEnrollLineIndex((prevIdx) => {
-            const nextIdx = prevIdx + 1 >= ENROLL_LINES.length ? 0 : prevIdx + 1;
-            enrollLineIndexRef.current = nextIdx;
-            return nextIdx;
-          });
-
-          setEnrollTranscript("");
-
-          // ✅ FIX: restart recognition cleanly so results reset & it keeps listening
-          stopEnrollSpeechRec();
-          setTimeout(() => {
-            if (enrollingRef.current) startEnrollSpeechRec();
-          }, 180);
-        }
-      };
-
-      sr.onerror = () => {};
-      sr.onend = () => {
-        // keep it running during enrollment
-        if (enrollingRef.current) {
-          setTimeout(() => {
-            if (enrollingRef.current) {
-              try {
-                sr.start?.();
-              } catch {}
-            }
-          }, 120);
-        }
-      };
-
-      sr.start();
-      enrollSRRef.current = sr;
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  useEffect(() => {
-    const count = enrollCompleted.filter(Boolean).length;
-    setEnrollCompletedCount(count);
-  }, [enrollCompleted]);
-
   // ---------- voiceprint storage helpers ----------
   function loadVoiceprints() {
     try {
@@ -268,11 +189,9 @@ export default function LiveCoach({
     return m?.[deviceId]?.vec || null;
   }
 
-  const isEnrolledForSelectedMic = useMemo(() => {
-    const v = getEnrolledVec(selectedDeviceId);
-    return Array.isArray(v) && v.length > 0;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDeviceId]);
+  // ✅ FIX: do NOT memoize this based only on deviceId (it must reflect localStorage changes after enrollment)
+  const enrolledVecForSelectedMic = getEnrolledVec(selectedDeviceId);
+  const isEnrolledForSelectedMic = Array.isArray(enrolledVecForSelectedMic) && enrolledVecForSelectedMic.length > 0;
 
   // ---------- voice features ----------
   function setupBandRanges(ctx, analyser) {
@@ -403,7 +322,7 @@ export default function LiveCoach({
 
     if (!isEnrolledForSelectedMic) {
       setStatus("Enrollment required");
-      setSayThisNext("Enroll your voice first (60 seconds) for this microphone.");
+      setSayThisNext("Enroll your voice first (read the 10 lines, then it will unlock).");
       return;
     }
 
@@ -481,8 +400,9 @@ export default function LiveCoach({
             const avg = calSamples ? calSum / calSamples : 0.02;
             noiseFloorRef.current = Math.max(0.01, Math.min(0.06, avg));
 
-            talkThresholdRef.current = Math.max(0.03, noiseFloorRef.current * 2.6);
-            silenceThresholdRef.current = Math.max(0.02, noiseFloorRef.current * 1.7);
+            // ✅ a bit more sensitive (helps quieter / faster speech)
+            talkThresholdRef.current = Math.max(0.028, noiseFloorRef.current * 2.2);
+            silenceThresholdRef.current = Math.max(0.018, noiseFloorRef.current * 1.5);
 
             calibratingRef.current = false;
           }
@@ -508,7 +428,9 @@ export default function LiveCoach({
           }
         } else if (rms <= SIL) {
           const silentFor = now - lastSpeechMsRef.current;
-          const SILENCE_MS = 850;
+
+          // ✅ slightly shorter pause so “fast talk” still triggers reliably
+          const SILENCE_MS = 650;
 
           if (inSpeechRef.current && heardSpeechSinceSuggestionRef.current && silentFor >= SILENCE_MS) {
             inSpeechRef.current = false;
@@ -532,7 +454,7 @@ export default function LiveCoach({
 
             if (segVec && enrolledVec) {
               sim = cosineSim(segVec, enrolledVec);
-              speaker = sim >= matchThreshold ? "Agent" : "Client";
+              speaker = sim >= matchThresholdRef.current ? "Agent" : "Client";
             }
 
             setVoiceSimilarity(sim);
@@ -563,9 +485,137 @@ export default function LiveCoach({
     setSayThisNext("Stopped. Click START to listen again.");
   }
 
+  // ---------- Enrollment Speech Recognition ----------
+  function stopEnrollSpeechRec() {
+    try {
+      const sr = enrollSRRef.current;
+      if (!sr) return;
+      sr.onresult = null;
+      sr.onerror = null;
+      sr.onend = null;
+      sr.stop?.();
+    } catch {}
+    enrollSRRef.current = null;
+  }
+
+  function resetLineTranscript() {
+    srCommittedRef.current = "";
+    srInterimRef.current = "";
+    setEnrollTranscript("");
+  }
+
+  function startEnrollSpeechRec() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return false;
+
+    stopEnrollSpeechRec();
+
+    try {
+      const sr = new SR();
+      sr.continuous = true;
+      sr.interimResults = true;
+      sr.lang = "en-US";
+
+      resetLineTranscript();
+
+      sr.onresult = (e) => {
+        // Build committed + interim for “current line” without restarting SR (fixes fast speech misses)
+        let newCommitted = srCommittedRef.current;
+        let interim = "";
+
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const t = e.results[i][0]?.transcript ? e.results[i][0].transcript : "";
+          if (!t) continue;
+
+          if (e.results[i].isFinal) {
+            newCommitted = (newCommitted + " " + t).trim();
+          } else {
+            interim = (interim + " " + t).trim();
+          }
+        }
+
+        srCommittedRef.current = newCommitted;
+        srInterimRef.current = interim;
+
+        const full = (newCommitted + " " + interim).trim();
+        setEnrollTranscript(full);
+
+        const idx = enrollLineIndexRef.current;
+        const currentLine = ENROLL_LINES[idx] || "";
+
+        const { ratio, matchedCount, expectedCount } = computeMatch(currentLine, full);
+
+        // ✅ more forgiving + also require some minimum matched words
+        const DONE_AT = 0.74;
+        const minWords = Math.min(6, expectedCount || 0); // avoid 1-word accidental completes
+
+        const now = Date.now();
+        if (
+          expectedCount > 0 &&
+          ratio >= DONE_AT &&
+          matchedCount >= minWords &&
+          now - lastAdvanceMsRef.current > 450 &&
+          enrollingRef.current &&
+          !enrollFinalizedRef.current
+        ) {
+          lastAdvanceMsRef.current = now;
+
+          // mark current line complete
+          const prevArr = enrollCompletedRef.current;
+          const nextArr = [...prevArr];
+          if (!nextArr[idx]) nextArr[idx] = true;
+
+          // compute next count immediately
+          const nextCount = nextArr.filter(Boolean).length;
+          setEnrollCompleted(nextArr);
+          enrollCompletedRef.current = nextArr;
+
+          // If all 10 done, finalize early (unlock Live Coach immediately)
+          if (nextCount >= ENROLL_LINES.length) {
+            enrollFinalizedRef.current = true;
+            setSayThisNext("Completed ✅ Saving enrollment…");
+            finalizeEnrollRef.current?.();
+            return;
+          }
+
+          // advance line
+          const nextIdx = idx + 1 >= ENROLL_LINES.length ? 0 : idx + 1;
+          setEnrollLineIndex(nextIdx);
+          enrollLineIndexRef.current = nextIdx;
+
+          // reset transcript for next line (no SR restart needed)
+          resetLineTranscript();
+        }
+      };
+
+      sr.onerror = () => {};
+      sr.onend = () => {
+        // keep it running during enrollment
+        if (enrollingRef.current && !enrollFinalizedRef.current) {
+          setTimeout(() => {
+            if (enrollingRef.current && !enrollFinalizedRef.current) {
+              try {
+                sr.start?.();
+              } catch {}
+            }
+          }, 120);
+        }
+      };
+
+      sr.start();
+      enrollSRRef.current = sr;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ---------- Enrollment ----------
   function stopEnrollmentHard() {
     enrollingRef.current = false;
+    enrollFinalizedRef.current = false;
+    finalizeEnrollRef.current = null;
+
     stopEnrollSpeechRec();
 
     if (enrollStopRef.current) {
@@ -581,9 +631,11 @@ export default function LiveCoach({
     enrollFramesRef.current = 0;
 
     setEnrollLineIndex(0);
-    setEnrollTranscript("");
+    enrollLineIndexRef.current = 0;
+
+    resetLineTranscript();
+
     setEnrollCompleted(new Array(10).fill(false));
-    setEnrollCompletedCount(0);
     setStatus("Idle");
   }
 
@@ -601,6 +653,7 @@ export default function LiveCoach({
 
     setEnrolling(true);
     enrollingRef.current = true;
+    enrollFinalizedRef.current = false;
 
     setEnrollSecondsLeft(60);
     setDetectedSpeaker("Unknown");
@@ -610,9 +663,9 @@ export default function LiveCoach({
     enrollLineIndexRef.current = 0;
     lastAdvanceMsRef.current = 0;
 
-    setEnrollTranscript("");
+    resetLineTranscript();
+
     setEnrollCompleted(new Array(10).fill(false));
-    setEnrollCompletedCount(0);
 
     startEnrollSpeechRec();
 
@@ -651,6 +704,62 @@ export default function LiveCoach({
       const startMs = Date.now();
       const totalMs = 60_000;
 
+      const cleanupAudio = () => {
+        try {
+          if (raf) cancelAnimationFrame(raf);
+        } catch {}
+        try {
+          stream?.getTracks()?.forEach((t) => t.stop());
+        } catch {}
+        try {
+          ctx?.close?.();
+        } catch {}
+      };
+
+      const finalize = () => {
+        cleanupAudio();
+
+        enrollingRef.current = false;
+        stopEnrollSpeechRec();
+
+        let vec = null;
+        if (enrollSumRef.current && enrollFramesRef.current > 8) {
+          vec = enrollSumRef.current.map((x) => x / enrollFramesRef.current);
+
+          let n = 0;
+          for (let i = 0; i < vec.length; i++) n += vec[i] * vec[i];
+          n = Math.sqrt(n) || 1;
+          vec = vec.map((x) => x / n);
+        }
+
+        setEnrolling(false);
+        setEnrollSecondsLeft(60);
+        setMicLevel(0);
+
+        finalizeEnrollRef.current = null;
+
+        if (!vec) {
+          setStatus("Enrollment failed");
+          setSayThisNext("Not enough clear speech captured. Try again and read the lines louder.");
+          enrollFinalizedRef.current = false;
+          return;
+        }
+
+        const all = loadVoiceprints();
+        all[selectedDeviceId] = {
+          vec,
+          createdAt: new Date().toISOString(),
+          seconds: 60,
+        };
+        saveVoiceprints(all);
+
+        setStatus("Enrolled");
+        setSayThisNext("Enrollment saved for this microphone. You can now START Live Coach.");
+      };
+
+      // allow speech-rec to finalize early when 10/10 is done
+      finalizeEnrollRef.current = finalize;
+
       const tick = () => {
         analyser.getByteTimeDomainData(timeData);
 
@@ -673,17 +782,18 @@ export default function LiveCoach({
             const avg = calSamples ? calSum / calSamples : 0.02;
             noiseFloorRef.current = Math.max(0.01, Math.min(0.06, avg));
 
-            talkThresholdRef.current = Math.max(0.03, noiseFloorRef.current * 2.6);
-            silenceThresholdRef.current = Math.max(0.02, noiseFloorRef.current * 1.7);
+            // ✅ more sensitive capture
+            talkThresholdRef.current = Math.max(0.028, noiseFloorRef.current * 2.2);
+            silenceThresholdRef.current = Math.max(0.018, noiseFloorRef.current * 1.5);
 
             calibratingRef.current = false;
           }
         } else {
           if (rms >= talkThresholdRef.current) {
             analyser.getFloatFrequencyData(freqDb);
-            const vec = extractBandVector(freqDb);
-            if (vec) {
-              for (let i = 0; i < vec.length; i++) enrollSumRef.current[i] += vec[i];
+            const v = extractBandVector(freqDb);
+            if (v) {
+              for (let i = 0; i < v.length; i++) enrollSumRef.current[i] += v[i];
               enrollFramesRef.current += 1;
             }
           }
@@ -693,70 +803,26 @@ export default function LiveCoach({
         const left = Math.max(0, Math.ceil((totalMs - elapsed) / 1000));
         setEnrollSecondsLeft(left);
 
-        if (elapsed >= totalMs) {
+        // stop if timer ends (unless we already finalized early)
+        if (elapsed >= totalMs && !enrollFinalizedRef.current) {
+          enrollFinalizedRef.current = true;
           finalize();
+          return;
+        }
+
+        // if speech already finalized early, stop ticking
+        if (enrollFinalizedRef.current) {
           return;
         }
 
         raf = requestAnimationFrame(tick);
       };
 
-      const finalize = () => {
-        if (raf) cancelAnimationFrame(raf);
-
-        try {
-          stream?.getTracks()?.forEach((t) => t.stop());
-        } catch {}
-        try {
-          ctx?.close?.();
-        } catch {}
-
-        enrollingRef.current = false;
-        stopEnrollSpeechRec();
-
-        let vec = null;
-        if (enrollSumRef.current && enrollFramesRef.current > 15) {
-          vec = enrollSumRef.current.map((x) => x / enrollFramesRef.current);
-
-          let n = 0;
-          for (let i = 0; i < vec.length; i++) n += vec[i] * vec[i];
-          n = Math.sqrt(n) || 1;
-          vec = vec.map((x) => x / n);
-        }
-
-        setEnrolling(false);
-        setEnrollSecondsLeft(60);
-        setMicLevel(0);
-
-        if (!vec) {
-          setStatus("Enrollment failed");
-          setSayThisNext("Not enough clear speech captured. Try again and read the lines louder.");
-          return;
-        }
-
-        const all = loadVoiceprints();
-        all[selectedDeviceId] = {
-          vec,
-          createdAt: new Date().toISOString(),
-          seconds: 60,
-        };
-        saveVoiceprints(all);
-
-        setStatus("Enrolled");
-        setSayThisNext("Enrollment saved for this microphone. You can now START Live Coach.");
-      };
-
       enrollStopRef.current = () => {
-        if (raf) cancelAnimationFrame(raf);
-        try {
-          stream?.getTracks()?.forEach((t) => t.stop());
-        } catch {}
-        try {
-          ctx?.close?.();
-        } catch {}
-
+        cleanupAudio();
         enrollingRef.current = false;
         stopEnrollSpeechRec();
+        finalizeEnrollRef.current = null;
 
         setEnrolling(false);
         setEnrollSecondsLeft(60);
@@ -809,16 +875,23 @@ export default function LiveCoach({
             <div className="panelTitle">Voice Enrollment Required</div>
 
             <div className="smallMuted" style={{ marginTop: 0 }}>
-              Read each line out loud. It highlights as you speak and auto-advances. If you finish all 10 lines
-              before 60 seconds, it loops back so you can keep talking.
+              Read each line out loud. It highlights as you speak and auto-advances. When you hit 10/10, it saves
+              immediately and unlocks Live Coach.
             </div>
 
             <div className="sayBox" style={{ marginTop: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <div style={{ fontWeight: 950 }}>
-                  Line {enrollLineIndex + 1}/10{" "}
-                  <span style={{ color: C.emerald }}>• {enrollCompletedCount}/10 complete</span>
+                  {enrollCompletedCount >= 10 ? (
+                    <span style={{ color: C.emerald }}>Completed ✅</span>
+                  ) : (
+                    <>
+                      Line {enrollLineIndex + 1}/10{" "}
+                      <span style={{ color: C.emerald }}>• {enrollCompletedCount}/10 complete</span>
+                    </>
+                  )}
                 </div>
+
                 <div style={{ fontWeight: 900, color: "rgba(237,239,242,0.75)" }}>
                   {enrolling ? (
                     <>
@@ -859,7 +932,7 @@ export default function LiveCoach({
 
             <div className="row2" style={{ marginTop: 12 }}>
               <button className="btnOutline" disabled={enrolling || !selectedDeviceId} onClick={startEnrollment60s}>
-                START 60s ENROLLMENT
+                START ENROLLMENT
               </button>
               <button className="btnOutlineDim" disabled={!enrolling} onClick={stopEnrollmentHard}>
                 STOP
