@@ -2,14 +2,9 @@
 export default function Home({ setView }) {
   const cards = [
     {
-      title: "Live Coach",
-      desc: "Requires 60s voice enrollment per mic. Detects Agent vs Client locally.",
+      title: "HALO Leads",
+      desc: "On-screen guided sales flow. Listens to agent voice only and advances when script is matched.",
       onClick: () => setView("live"),
-    },
-    {
-      title: "Recorder",
-      desc: "Records mic audio. Stop → Download the file for review.",
-      onClick: () => setView("record"),
     },
     {
       title: "Roleplay Trainer",
@@ -34,12 +29,12 @@ export default function Home({ setView }) {
         <div className="howTitle">How it works</div>
         <ol className="howList">
           <li>Select your microphone.</li>
-          <li>Live Coach requires a 60-second voice enrollment (local-only) for that mic.</li>
-          <li>Enrollment guides you through 10 lines with live highlighting.</li>
-          <li>Momentum AI detects Agent vs Client by matching your voiceprint.</li>
+          <li>HALO Leads displays the full script from start to finish.</li>
+          <li>The system listens to agent speech only.</li>
+          <li>The script advances automatically when your wording matches the expected line.</li>
         </ol>
         <div className="howNote">
-          Note: This is a lightweight local voice “fingerprint,” not bank-grade biometric security.
+          Note: HALO Leads does not record calls and does not use voiceprints or biometric identification.
         </div>
       </div>
     </>
